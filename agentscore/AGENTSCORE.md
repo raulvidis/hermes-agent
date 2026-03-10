@@ -96,8 +96,16 @@ Only these fields are written to the AgentScore smart contract:
 | `toolErrors` | uint16 | Number of errored tool calls |
 | `duration` | uint32 | Wall-clock seconds |
 | `completed` | bool | Whether the interaction finished normally |
+| `modelHash` | bytes32 | keccak256 of model identifier (e.g. "anthropic/claude-opus-4-20250514") |
+| `inputTokens` | uint32 | Total input/prompt tokens consumed |
+| `outputTokens` | uint32 | Total output/completion tokens consumed |
 | `metricsHash` | bytes32 | keccak256 of private metrics JSON |
 | `timestamp` | uint64 | Block timestamp |
+
+The `modelHash` allows public verification of which model was used: anyone who
+knows the model string can hash it and compare against the on-chain value. This
+enables per-model reputation tracking (e.g. "how reliable is this agent when
+using Claude vs GPT-4?") without leaking any other information.
 
 ### What NEVER goes on-chain
 

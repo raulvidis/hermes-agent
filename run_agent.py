@@ -3340,6 +3340,7 @@ class AIAgent:
             if self.step_callback is not None:
                 try:
                     prev_tools = []
+                    prev_tool_errors = 0
                     for _m in reversed(messages):
                         if _m.get("role") == "assistant" and _m.get("tool_calls"):
                             prev_tools = [
@@ -3348,7 +3349,22 @@ class AIAgent:
                                 if isinstance(tc, dict)
                             ]
                             break
-                    self.step_callback(api_call_count, prev_tools)
+                    # Count tool errors from the most recent tool result messages
+                    for _m in reversed(messages):
+                        if _m.get("role") == "tool":
+                            _err, _ = _detect_tool_failure(
+                                _m.get("name", ""), _m.get("content", "")
+                            )
+                            if _err:
+                                prev_tool_errors += 1
+                        elif _m.get("role") == "assistant":
+                            break  # Stop at the assistant message that triggered tools
+                    self.step_callback(
+                        api_call_count, prev_tools, prev_tool_errors,
+                        self.model,
+                        self.session_prompt_tokens,
+                        self.session_completion_tokens,
+                    )
                 except Exception as _step_err:
                     logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 

@@ -252,6 +252,8 @@ class GatewayRunner:
                 self._agentscore_tracker = create_tracker(
                     network=_as_cfg.get("network", "base-sepolia"),
                 )
+                from agentscore.tracker import setup_shutdown_handler
+                setup_shutdown_handler(self._agentscore_tracker)
         except ImportError:
             pass  # web3 not installed — silently skip
         except Exception as e:
@@ -1331,7 +1333,11 @@ class GatewayRunner:
             agent_messages = agent_result.get("messages", [])
             
             # Emit agent:end hook
-            _end_ctx = {**hook_ctx, "response": (response or "")[:500]}
+            _end_ctx = {
+                **hook_ctx,
+                "response": (response or "")[:500],
+                "completed": agent_result.get("completed", True),
+            }
             await self.hooks.emit("agent:end", _end_ctx)
             if self._agentscore_tracker:
                 self._agentscore_tracker.on_end(_end_ctx)
@@ -3056,13 +3062,30 @@ class GatewayRunner:
         _loop_for_step = asyncio.get_event_loop()
         _hooks_ref = self.hooks
 
-        def _step_callback_sync(iteration: int, tool_names: list) -> None:
+        _prev_input_tokens = [0]
+        _prev_output_tokens = [0]
+
+        def _step_callback_sync(
+            iteration: int, tool_names: list, tool_errors: int = 0,
+            model: str = "", cumulative_input_tokens: int = 0,
+            cumulative_output_tokens: int = 0,
+        ) -> None:
+            # Compute per-step token deltas from cumulative totals
+            input_delta = cumulative_input_tokens - _prev_input_tokens[0]
+            output_delta = cumulative_output_tokens - _prev_output_tokens[0]
+            _prev_input_tokens[0] = cumulative_input_tokens
+            _prev_output_tokens[0] = cumulative_output_tokens
+
             _step_ctx = {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
                 "session_id": session_id,
                 "iteration": iteration,
                 "tool_names": tool_names,
+                "tool_errors": tool_errors,
+                "model": model,
+                "input_tokens": max(input_delta, 0),
+                "output_tokens": max(output_delta, 0),
             }
             try:
                 asyncio.run_coroutine_threadsafe(
