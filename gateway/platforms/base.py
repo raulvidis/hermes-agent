@@ -705,15 +705,22 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
                 
+                # Build metadata from the incoming event (e.g. forum thread_id)
+                _metadata = {}
+                if event.source.thread_id:
+                    _metadata["thread_id"] = event.source.thread_id
+                _send_meta = _metadata or None
+
                 # Send the text portion first (if any remains after extractions)
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     result = await self.send(
                         chat_id=event.source.chat_id,
                         content=text_content,
-                        reply_to=event.message_id
+                        reply_to=event.message_id,
+                        metadata=_send_meta,
                     )
-                    
+
                     # Log send failures (don't raise - user already saw tool progress)
                     if not result.success:
                         print(f"[{self.name}] Failed to send response: {result.error}")
@@ -721,7 +728,8 @@ class BasePlatformAdapter(ABC):
                         fallback_result = await self.send(
                             chat_id=event.source.chat_id,
                             content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
-                            reply_to=event.message_id
+                            reply_to=event.message_id,
+                            metadata=_send_meta,
                         )
                         if not fallback_result.success:
                             print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
