@@ -53,6 +53,7 @@ pty = [
 honcho = ["honcho-ai>=2.0.1"]
 mcp = ["mcp>=1.2.0"]
 homeassistant = ["aiohttp>=3.9.0"]
+agentscore = ["web3>=7.0"]
 yc-bench = ["yc-bench @ git+https://github.com/collinear-ai/yc-bench.git"]
 all = [
   "hermes-agent[modal]",
@@ -67,6 +68,7 @@ all = [
   "hermes-agent[honcho]",
   "hermes-agent[mcp]",
   "hermes-agent[homeassistant]",
+  "hermes-agent[agentscore]",
 ]
 
 [project.scripts]
@@ -77,7 +79,7 @@ hermes-agent = "run_agent:main"
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_constants"]
 
 [tool.setuptools.packages.find]
-include = ["tools", "hermes_cli", "gateway", "cron", "honcho_integration"]
+include = ["tools", "hermes_cli", "gateway", "cron", "honcho_integration", "agentscore"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -241,6 +241,21 @@ class GatewayRunner:
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
+
+        # AgentScore — on-chain reputation tracker (zero token impact).
+        self._agentscore_tracker = None
+        try:
+            from hermes_cli.config import load_config
+            _as_cfg = load_config().get("agentscore", {})
+            if _as_cfg.get("enabled"):
+                from agentscore.tracker import create_tracker
+                self._agentscore_tracker = create_tracker(
+                    network=_as_cfg.get("network", "base-sepolia"),
+                )
+        except ImportError:
+            pass  # web3 not installed — silently skip
+        except Exception as e:
+            logger.debug("AgentScore init: %s", e)
     
     def _flush_memories_for_session(self, old_session_id: str):
         """Prompt the agent to save memories/skills before context is lost.
@@ -1299,6 +1314,8 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
+            if self._agentscore_tracker:
+                self._agentscore_tracker.on_start(hook_ctx)
             
             # Run the agent
             agent_result = await self._run_agent(
@@ -1314,10 +1331,10 @@ class GatewayRunner:
             agent_messages = agent_result.get("messages", [])
             
             # Emit agent:end hook
-            await self.hooks.emit("agent:end", {
-                **hook_ctx,
-                "response": (response or "")[:500],
-            })
+            _end_ctx = {**hook_ctx, "response": (response or "")[:500]}
+            await self.hooks.emit("agent:end", _end_ctx)
+            if self._agentscore_tracker:
+                self._agentscore_tracker.on_end(_end_ctx)
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -3040,19 +3057,22 @@ class GatewayRunner:
         _hooks_ref = self.hooks
 
         def _step_callback_sync(iteration: int, tool_names: list) -> None:
+            _step_ctx = {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "session_id": session_id,
+                "iteration": iteration,
+                "tool_names": tool_names,
+            }
             try:
                 asyncio.run_coroutine_threadsafe(
-                    _hooks_ref.emit("agent:step", {
-                        "platform": source.platform.value if source.platform else "",
-                        "user_id": source.user_id,
-                        "session_id": session_id,
-                        "iteration": iteration,
-                        "tool_names": tool_names,
-                    }),
+                    _hooks_ref.emit("agent:step", _step_ctx),
                     _loop_for_step,
                 )
             except Exception as _e:
                 logger.debug("agent:step hook error: %s", _e)
+            if self._agentscore_tracker:
+                self._agentscore_tracker.on_step(_step_ctx)
 
         def run_sync():
             # Pass session_key to process registry via env var so background
