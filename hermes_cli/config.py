@@ -179,6 +179,15 @@ DEFAULT_CONFIG = {
     # Permanently allowed dangerous command patterns (added via "always" approval)
     "command_allowlist": [],
 
+    # AgentScore — on-chain reputation tracking.  When enabled, the gateway
+    # passively records behavioral metrics (tool usage, completion rates) and
+    # attests them to the AgentScore contract on Base.  Zero token impact.
+    # Requires: pip install web3
+    "agentscore": {
+        "enabled": False,
+        "network": "base-sepolia",   # "base-sepolia" (testnet) or "base" (mainnet)
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 6,
 }
