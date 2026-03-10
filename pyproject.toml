@@ -92,4 +92,5 @@ testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
 ]
+asyncio_mode = "auto"
 addopts = "-m 'not integration' -n auto"
