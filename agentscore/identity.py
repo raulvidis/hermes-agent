@@ -47,8 +47,11 @@ def ensure_identity() -> Tuple[str, str]:
     KEY_FILE.write_text(private_key)
     try:
         os.chmod(KEY_FILE, 0o600)
-    except OSError:
-        pass  # Windows
+    except OSError as e:
+        logger.warning(
+            "[agentscore] Failed to set key file permissions (key may be world-readable): %s",
+            e,
+        )
 
     config = {
         "address": account.address,
@@ -66,6 +69,7 @@ def get_address() -> Optional[str]:
         return None
     try:
         from eth_account import Account
+
         private_key = KEY_FILE.read_text().strip()
         return Account.from_key(private_key).address
     except ImportError:
