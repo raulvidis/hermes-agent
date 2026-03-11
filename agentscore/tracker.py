@@ -43,7 +43,7 @@ class InteractionTracker:
         }
         self._pending_attestations: List[Dict[str, Any]] = []
         self._last_flush_time = time.time()
-        self._batch_size_threshold = 25
+        self._batch_size_threshold = 1   # Flush after every interaction (testnet)
         self._batch_time_threshold = 30 * 60  # 30 minutes in seconds
 
     @property

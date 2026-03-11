@@ -24,27 +24,36 @@
 ## Phase 1: Smart Contract (Blocker)
 
 ### 1.1 Write the Solidity contract
-- [ ] Create `agentscore/contracts/AgentScore.sol`
-- [ ] Functions: `register()`, `attest()`, `attestBatch()`, `getScore()`, `getAttestationCount()`
-- [ ] On-chain scoring algorithm (0–850 scale):
+- [x] Create `agentscore/contracts/AgentScore.sol`
+- [x] Functions: `register()`, `attest()`, `attestBatch()`, `getScore()`, `getAttestationCount()`
+- [x] On-chain scoring algorithm (0–850 scale):
   - Completion rate: 35%
   - Tool success rate: 35%
   - Volume factor: 30%
-- [ ] Storage: per-agent attestation array + registration mapping
-- [ ] Events for indexing: `Registered(address)`, `Attested(address, uint256 index)`
+- [x] Storage: per-agent attestation array + registration mapping
+- [x] Events for indexing: `Registered(address)`, `Attested(address, uint256 index)`
+- [x] Foundry project with 20 passing tests (`forge test`)
+- [x] Deployment script (`script/Deploy.s.sol`)
 
 ### 1.2 Deploy to Base Sepolia (testnet)
-- [ ] Set up Foundry or Hardhat project
-- [ ] Write deployment script
-- [ ] Deploy and verify on BaseScan
-- [ ] Save contract address to `~/.agentscore/contract.json`
-- [ ] Document faucet instructions (Base Sepolia ETH)
+- [x] Set up Foundry project (`agentscore/contracts/`)
+- [x] Write deployment script (`script/Deploy.s.sol` + `script/deploy.sh`)
+- [x] Deploy to Base Sepolia: `0x0414E5f85dB19072282b598Eb0a8B78e502aB767`
+- [x] Save contract address to `~/.agentscore/contract.json`
+- [ ] Verify on BaseScan (needs `BASESCAN_API_KEY`)
+- [x] Document faucet instructions (Base Sepolia ETH)
 
 ### 1.3 End-to-end test
-- [ ] Fund agent wallet with testnet ETH
-- [ ] Run gateway with `agentscore.enabled: true`
-- [ ] Verify attestations land on-chain via BaseScan
-- [ ] Query score via `getScore()` and validate
+- [x] Fund agent wallet with testnet ETH
+- [x] Run CLI chat with `agentscore.enabled: true`
+- [x] Verify attestations land on-chain via BaseScan
+- [ ] Query score via `getScore()` and validate (need 3+ attestations)
+
+### 1.4 Future: Gas-free attestation (not blocking)
+- Option A: Meta-transaction relayer (agent signs, relayer pays gas)
+- Option B: Coinbase Paymaster (EIP-4337, requires smart accounts)
+- Option C: Merkle root anchoring (O(1) gas regardless of agent count)
+- Decision: keep V1 direct attestation for now, revisit at scale
 
 ---
 

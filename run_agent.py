@@ -629,6 +629,25 @@ class AIAgent:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
+
+        # ── AgentScore: on-chain reputation tracking ──
+        # Initialized once per agent.  Tracks interactions across all sessions
+        # (CLI chat, gateway, batch runner).  Gracefully degrades if web3 is
+        # not installed or chain is unavailable.
+        self._agentscore_tracker = None
+        try:
+            from hermes_cli.config import load_config as _load_as_config
+            _as_cfg = _load_as_config().get("agentscore", {})
+            if _as_cfg.get("enabled"):
+                from agentscore.tracker import create_tracker, setup_shutdown_handler
+                self._agentscore_tracker = create_tracker(
+                    network=_as_cfg.get("network", "base-sepolia"),
+                )
+                setup_shutdown_handler(self._agentscore_tracker)
+                if not self.quiet_mode:
+                    print("📊 AgentScore: enabled")
+        except Exception as _as_err:
+            logger.debug("AgentScore init skipped: %s", _as_err)
     
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
@@ -3142,6 +3161,18 @@ class AIAgent:
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
         
+        # ── AgentScore: track interaction start ──
+        if self._agentscore_tracker:
+            try:
+                self._agentscore_tracker.on_start({
+                    "session_id": self.session_id,
+                    "model": self.model,
+                })
+            except Exception as _as_err:
+                logger.debug("AgentScore on_start failed: %s", _as_err)
+        _as_prev_prompt_tokens = self.session_prompt_tokens
+        _as_prev_completion_tokens = self.session_completion_tokens
+
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
         self._invalid_tool_retries = 0
@@ -3367,6 +3398,44 @@ class AIAgent:
                     )
                 except Exception as _step_err:
                     logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
+
+            # ── AgentScore: track each iteration ──
+            if self._agentscore_tracker:
+                try:
+                    _as_prev_tools = []
+                    _as_prev_errors = 0
+                    for _m in reversed(messages):
+                        if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                            _as_prev_tools = [
+                                tc["function"]["name"]
+                                for tc in _m["tool_calls"]
+                                if isinstance(tc, dict)
+                            ]
+                            break
+                    for _m in reversed(messages):
+                        if _m.get("role") == "tool":
+                            _err, _ = _detect_tool_failure(
+                                _m.get("name", ""), _m.get("content", "")
+                            )
+                            if _err:
+                                _as_prev_errors += 1
+                        elif _m.get("role") == "assistant":
+                            break
+                    _as_input_delta = max(self.session_prompt_tokens - _as_prev_prompt_tokens, 0)
+                    _as_output_delta = max(self.session_completion_tokens - _as_prev_completion_tokens, 0)
+                    _as_prev_prompt_tokens = self.session_prompt_tokens
+                    _as_prev_completion_tokens = self.session_completion_tokens
+                    self._agentscore_tracker.on_step({
+                        "session_id": self.session_id,
+                        "iteration": api_call_count,
+                        "tool_names": _as_prev_tools,
+                        "tool_errors": _as_prev_errors,
+                        "model": self.model,
+                        "input_tokens": _as_input_delta,
+                        "output_tokens": _as_output_delta,
+                    })
+                except Exception as _as_err:
+                    logger.debug("AgentScore on_step failed: %s", _as_err)
 
             # Track tool-calling iterations for skill nudge.
             # Counter resets whenever skill_manage is actually used.
@@ -4482,6 +4551,17 @@ class AIAgent:
         # Sync conversation to Honcho for user modeling
         if final_response and not interrupted:
             self._honcho_sync(original_user_message, final_response)
+
+        # ── AgentScore: track interaction end ──
+        if self._agentscore_tracker:
+            try:
+                self._agentscore_tracker.on_end({
+                    "session_id": self.session_id,
+                    "completed": completed and not interrupted,
+                    **({"error": "interrupted"} if interrupted else {}),
+                })
+            except Exception as _as_err:
+                logger.debug("AgentScore on_end failed: %s", _as_err)
 
         # Build result with interrupt info if applicable
         result = {

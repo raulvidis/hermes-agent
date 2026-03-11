@@ -242,22 +242,8 @@ class GatewayRunner:
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
 
-        # AgentScore — on-chain reputation tracker (zero token impact).
-        self._agentscore_tracker = None
-        try:
-            from hermes_cli.config import load_config
-            _as_cfg = load_config().get("agentscore", {})
-            if _as_cfg.get("enabled"):
-                from agentscore.tracker import create_tracker
-                self._agentscore_tracker = create_tracker(
-                    network=_as_cfg.get("network", "base-sepolia"),
-                )
-                from agentscore.tracker import setup_shutdown_handler
-                setup_shutdown_handler(self._agentscore_tracker)
-        except ImportError:
-            pass  # web3 not installed — silently skip
-        except Exception as e:
-            logger.debug("AgentScore init: %s", e)
+        # AgentScore tracking is now handled inside AIAgent.__init__
+        # (works for CLI, gateway, and batch runner sessions alike).
     
     def _flush_memories_for_session(self, old_session_id: str):
         """Prompt the agent to save memories/skills before context is lost.
@@ -1316,8 +1302,6 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
-            if self._agentscore_tracker:
-                self._agentscore_tracker.on_start(hook_ctx)
             
             # Run the agent
             agent_result = await self._run_agent(
@@ -1339,8 +1323,6 @@ class GatewayRunner:
                 "completed": agent_result.get("completed", True),
             }
             await self.hooks.emit("agent:end", _end_ctx)
-            if self._agentscore_tracker:
-                self._agentscore_tracker.on_end(_end_ctx)
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -3094,8 +3076,6 @@ class GatewayRunner:
                 )
             except Exception as _e:
                 logger.debug("agent:step hook error: %s", _e)
-            if self._agentscore_tracker:
-                self._agentscore_tracker.on_step(_step_ctx)
 
         def run_sync():
             # Pass session_key to process registry via env var so background
