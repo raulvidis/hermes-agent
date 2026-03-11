@@ -161,6 +161,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.streaming import StreamLane
 
 logger = logging.getLogger(__name__)
 
@@ -3197,6 +3198,106 @@ class GatewayRunner:
             
             progress_queue.put(msg)
         
+        # ── Streaming support for real-time reasoning updates ──────────────────────
+        # Queue for streaming text updates (thread-safe)
+        streaming_queue = queue.Queue()
+        streaming_text = [""]  # Mutable container for accumulated text
+        streaming_reasoning = [""]  # Mutable container for reasoning text
+        
+        def streaming_callback(text: str, is_reasoning: bool = False):
+            """Callback invoked by agent when streaming text is available."""
+            if is_reasoning:
+                streaming_reasoning[0] = text
+            else:
+                streaming_text[0] = text
+            streaming_queue.put(("reasoning" if is_reasoning else "text", text))
+        
+        def reasoning_stream_callback(text: str):
+            """Callback for reasoning/thinking content."""
+            streaming_callback(text, is_reasoning=True)
+        
+        # Background task to send streaming updates
+        _stream_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        
+        async def send_streaming_updates():
+            """Background task that updates the streaming message."""
+            adapter = self.adapters.get(source.platform)
+            if not adapter:
+                return
+            
+            # Check if adapter supports streaming
+            if not hasattr(adapter, 'streaming_enabled') or not adapter.streaming_enabled:
+                return
+            
+            stream_msg_id = {StreamLane.ANSWER: None, StreamLane.REASONING: None}  # Message IDs per lane
+            last_sent = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}  # Last sent text per lane
+            min_update_interval = 1.0  # Minimum seconds between updates (throttle)
+            last_update_time = [0]
+            
+            while True:
+                try:
+                    update_type, text = streaming_queue.get(timeout=0.5)
+                    lane = StreamLane.REASONING if update_type == "reasoning" else StreamLane.ANSWER
+                    
+                    # Skip if text hasn't changed significantly
+                    if abs(len(text) - len(last_sent[lane])) < 20 and text == last_sent[lane]:
+                        continue
+                    
+                    # Throttle updates
+                    now = asyncio.get_event_loop().time()
+                    if now - last_update_time[0] < min_update_interval:
+                        continue
+                    
+                    last_update_time[0] = now
+                    last_sent[lane] = text
+                    
+                    # Format text for display
+                    if lane == StreamLane.REASONING:
+                        display_text = f"<i>{text}</i>" if text else ""
+                    else:
+                        display_text = text
+                    
+                    # Update or create the stream
+                    if stream_msg_id[lane] is None:
+                        # Start new stream
+                        result = await adapter.stream_start(
+                            chat_id=source.chat_id,
+                            initial_text=display_text,
+                            thread_id=source.thread_id,
+                            lane=lane,
+                        )
+                        if result.success and result.raw_response:
+                            stream_msg_id[lane] = result.raw_response.get("stream_key")
+                    else:
+                        # Update existing stream
+                        await adapter.stream_update(
+                            chat_id=source.chat_id,
+                            text=display_text,
+                            lane=lane,
+                        )
+                    
+                    # Restore typing indicator
+                    await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
+                    
+                except queue.Empty:
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    # Finalize streams on cancel
+                    for lane in [StreamLane.ANSWER, StreamLane.REASONING]:
+                        if stream_msg_id[lane]:
+                            try:
+                                await adapter.stream_end(
+                                    chat_id=source.chat_id,
+                                    final_text=last_sent[lane],
+                                    lane=lane,
+                                )
+                            except Exception:
+                                pass
+                    return
+                except Exception as e:
+                    logger.debug("Streaming update error: %s", e)
+                    await asyncio.sleep(0.5)
+        
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited
         _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
@@ -3369,6 +3470,8 @@ class GatewayRunner:
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
                 step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
+                streaming_callback=streaming_callback,
+                reasoning_callback=reasoning_stream_callback,
                 platform=platform_key,
                 honcho_session_key=session_key,
                 honcho_manager=honcho_manager,
@@ -3510,6 +3613,9 @@ class GatewayRunner:
         if tool_progress_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
         
+        # Start streaming updates task
+        streaming_task = asyncio.create_task(send_streaming_updates())
+        
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created
         async def track_agent():
@@ -3587,9 +3693,10 @@ class GatewayRunner:
                     session_key=session_key
                 )
         finally:
-            # Stop progress sender and interrupt monitor
+            # Stop progress sender, streaming, and interrupt monitor
             if progress_task:
                 progress_task.cancel()
+            streaming_task.cancel()
             interrupt_monitor.cancel()
             
             # Clean up tracking
@@ -3598,7 +3705,7 @@ class GatewayRunner:
                 del self._running_agents[session_key]
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task]:
+            for task in [progress_task, streaming_task, interrupt_monitor, tracking_task]:
                 if task:
                     try:
                         await task

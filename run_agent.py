@@ -230,6 +230,7 @@ class AIAgent:
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
         step_callback: callable = None,
+        streaming_callback: callable = None,  # Called with (text, is_reasoning) for real-time updates
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -327,6 +328,7 @@ class AIAgent:
         self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
+        self.streaming_callback = streaming_callback  # Real-time text streaming
         self._last_reported_tool = None  # Track for "new tool" mode
         
         # Interrupt mechanism for breaking out of tool loops

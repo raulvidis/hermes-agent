@@ -59,6 +59,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
+from gateway.streaming import StreamingManager, StreamLane, ReasoningLaneCoordinator
 
 
 def check_telegram_requirements() -> bool:
@@ -111,6 +112,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        self._streaming_manager: Optional[StreamingManager] = None
+        self._streaming_enabled: bool = getattr(config, 'streaming_enabled', True)
     
     async def connect(self) -> bool:
         """Connect to Telegram and start polling for updates."""
@@ -186,6 +189,12 @@ class TelegramAdapter(BasePlatformAdapter):
             
             self._running = True
             logger.info("[%s] Connected and polling for Telegram updates", self.name)
+            
+            # Initialize streaming manager
+            if self._streaming_enabled:
+                self._streaming_manager = StreamingManager(self, throttle_ms=1000)
+                logger.info("[%s] Streaming enabled for real-time message updates", self.name)
+            
             return True
             
         except Exception as e:
@@ -319,6 +328,167 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def stream_start(
+        self,
+        chat_id: str,
+        initial_text: str = "",
+        thread_id: Optional[int] = None,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """
+        Start a streaming message for real-time updates.
+        
+        The message will be created and can be updated via stream_update().
+        Use stream_end() to finalize.
+        
+        Args:
+            chat_id: Target chat ID
+            initial_text: Optional initial text (min 30 chars for push notification quality)
+            thread_id: Thread/topic ID for forum messages
+            lane: Stream lane (ANSWER or REASONING)
+            
+        Returns:
+            SendResult with stream_key in raw_response
+        """
+        if not self._streaming_manager or not self._streaming_enabled:
+            # Fallback to regular send if streaming disabled
+            if initial_text:
+                return await self.send(chat_id, initial_text, metadata={"thread_id": thread_id})
+            return SendResult(success=False, error="Streaming not enabled")
+        
+        try:
+            stream_key = await self._streaming_manager.start_stream(
+                chat_id=int(chat_id),
+                thread_id=thread_id,
+                lane=lane,
+            )
+            
+            if initial_text:
+                await self._streaming_manager.update_stream(int(chat_id), initial_text, lane)
+                
+            return SendResult(
+                success=True,
+                raw_response={"stream_key": stream_key, "lane": lane.value}
+            )
+        except Exception as e:
+            logger.error("[%s] Failed to start stream: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def stream_update(
+        self,
+        chat_id: str,
+        text: str,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """
+        Update a streaming message with new text.
+        
+        The update is debounced - it may not send immediately to avoid
+        hitting Telegram's rate limits. The text accumulates until
+        the throttle interval passes.
+        
+        Args:
+            chat_id: Target chat ID
+            text: Current full text to display
+            lane: Stream lane to update
+            
+        Returns:
+            SendResult indicating if update was queued
+        """
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+        
+        try:
+            await self._streaming_manager.update_stream(int(chat_id), text, lane)
+            return SendResult(success=True)
+        except Exception as e:
+            logger.error("[%s] Failed to update stream: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def stream_end(
+        self,
+        chat_id: str,
+        final_text: Optional[str] = None,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """
+        Finalize a streaming message.
+        
+        Flushes any pending text and stops the stream. The message
+        remains in the chat as a regular message.
+        
+        Args:
+            chat_id: Target chat ID
+            final_text: Optional final text (if different from last update)
+            lane: Stream lane to end
+            
+        Returns:
+            SendResult with the final message_id
+        """
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+        
+        try:
+            # Send final update if provided
+            if final_text:
+                await self._streaming_manager.update_stream(int(chat_id), final_text, lane)
+            
+            # Flush and stop
+            await self._streaming_manager.flush_stream(int(chat_id), lane)
+            message_id = self._streaming_manager.get_stream_message_id(int(chat_id), lane)
+            await self._streaming_manager.stop_stream(int(chat_id), lane)
+            
+            return SendResult(
+                success=True,
+                message_id=str(message_id) if message_id else None,
+            )
+        except Exception as e:
+            logger.error("[%s] Failed to end stream: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def stream_reasoning(
+        self,
+        chat_id: str,
+        reasoning_text: str,
+        answer_text: str,
+        thread_id: Optional[int] = None,
+    ) -> Dict[str, SendResult]:
+        """
+        Stream both reasoning and answer lanes simultaneously.
+        
+        This is a convenience method for the dual-lane streaming pattern.
+        Reasoning text appears in one message (italic), answer in another.
+        
+        Args:
+            chat_id: Target chat ID
+            reasoning_text: Thinking/reasoning content
+            answer_text: Main answer content
+            thread_id: Thread/topic ID for forum messages
+            
+        Returns:
+            Dict with 'reasoning' and 'answer' SendResults
+        """
+        results = {}
+        
+        # Update reasoning lane if there's reasoning content
+        if reasoning_text:
+            results["reasoning"] = await self.stream_update(
+                chat_id, reasoning_text, lane=StreamLane.REASONING
+            )
+        
+        # Update answer lane
+        if answer_text:
+            results["answer"] = await self.stream_update(
+                chat_id, answer_text, lane=StreamLane.ANSWER
+            )
+        
+        return results
+
+    @property
+    def streaming_enabled(self) -> bool:
+        """Check if streaming is enabled for this adapter."""
+        return self._streaming_enabled and self._streaming_manager is not None
 
     async def send_voice(
         self,
