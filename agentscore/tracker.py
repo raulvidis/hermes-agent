@@ -1,19 +1,19 @@
 """
 In-memory interaction tracker for AgentScore.
 
-Tracks each agent interaction (user message → agent response cycle)
-purely in memory.  On interaction end, computes a privacy-preserving
-metrics hash and submits an on-chain attestation.
+Tracks each agent interaction (user message -> agent response cycle)
+purely in memory.  On interaction end, submits an attestation to the
+AgentScore relay server via HTTP (no web3/gas needed).
 
 Design principles:
   - Zero token impact: runs outside the LLM conversation loop.
   - Zero persistence: all state is in-memory, discarded after attestation.
   - Privacy-first: only tool_calls, tool_errors, duration, completed go
     on-chain.  No user IDs, session IDs, messages, or platform names.
-  - Tamper-proof: metrics are captured from gateway events that the agent
-    process cannot intercept or modify.
+  - No blockchain dependency: agents talk to the relay server over HTTP.
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -25,16 +25,16 @@ logger = logging.getLogger(__name__)
 
 class InteractionTracker:
     """
-    Tracks in-flight interactions and attests completed ones on-chain.
+    Tracks in-flight interactions and attests completed ones via the relay.
 
     Thread-safe — the gateway fires events from both async and sync
     contexts via run_coroutine_threadsafe.
     """
 
-    def __init__(self, chain_client=None):
+    def __init__(self, sdk_client=None):
         self._interactions: Dict[str, Dict[str, Any]] = {}
         self._lock = Lock()
-        self._chain = chain_client
+        self._sdk = sdk_client
         self._stats = {
             "tracked": 0,
             "attested": 0,
@@ -77,7 +77,6 @@ class InteractionTracker:
         with self._lock:
             interaction = self._interactions.get(session_id)
             if interaction is None:
-                # Missed agent:start — create a late entry.
                 interaction = {
                     "started_at": time.time(),
                     "iterations": 0,
@@ -100,30 +99,15 @@ class InteractionTracker:
                 interaction["total_tool_calls"] += len(tool_names)
 
             interaction["total_tool_errors"] += tool_errors
-
-            # Accumulate token usage from each step
             interaction["input_tokens"] += context.get("input_tokens", 0)
             interaction["output_tokens"] += context.get("output_tokens", 0)
 
-            # Update model if provided (may change mid-session with fallback)
             model = context.get("model", "")
             if model:
                 interaction["model"] = model
 
     def on_end(self, context: Dict[str, Any]) -> None:
-        """
-        Finalize an interaction and attest on-chain.
-
-        Called on agent:end.  Pops the in-memory state, computes
-        metrics, and submits.  Interactions with no tool calls are
-        skipped (simple chat exchanges don't contribute to reputation).
-
-        The context may include:
-          - completed: bool — False if the interaction was interrupted,
-            timed out, or hit the iteration budget. Defaults to True
-            (agent:end fired normally).
-          - error: str — if present, marks the interaction as incomplete.
-        """
+        """Finalize an interaction and submit attestation."""
         session_id = context.get("session_id", "")
         if not session_id:
             return
@@ -136,7 +120,6 @@ class InteractionTracker:
 
         self._stats["tracked"] += 1
 
-        # Skip trivial interactions (no tool usage = nothing to score).
         if interaction["total_tool_calls"] == 0:
             self._stats["skipped"] += 1
             return
@@ -144,16 +127,11 @@ class InteractionTracker:
         duration = int(time.time() - interaction["started_at"])
         tool_calls = interaction["total_tool_calls"]
         tool_errors = interaction.get("total_tool_errors", 0)
-        # Completed unless the caller explicitly signals otherwise
-        # (e.g. interrupted, timed out, budget exhausted, or error).
         completed = context.get("completed", "error" not in context)
         model = interaction.get("model", "")
         input_tokens = interaction.get("input_tokens", 0)
         output_tokens = interaction.get("output_tokens", 0)
 
-        # Build the private metrics payload (never goes on-chain).
-        # Only its keccak256 hash is attested, allowing future
-        # verification without revealing the data.
         private_metrics = {
             "tool_calls": tool_calls,
             "tool_errors": tool_errors,
@@ -189,8 +167,8 @@ class InteractionTracker:
         output_tokens: int,
         private_metrics: Dict[str, Any],
     ) -> None:
-        """Hash private metrics and queue for batch submission."""
-        if self._chain is None or not self._chain.is_ready():
+        """Hash private metrics and queue for batch submission via relay."""
+        if self._sdk is None:
             logger.info(
                 "[agentscore] (offline) model=%s tools=%d errors=%d duration=%ds "
                 "tokens=%d/%d completed=%s",
@@ -199,29 +177,22 @@ class InteractionTracker:
             )
             return
 
-        metrics_hash = None
         try:
-            from web3 import Web3
-
             metrics_json = json.dumps(private_metrics, sort_keys=True)
-            metrics_hash = Web3.keccak(text=metrics_json)
-            # Hash the model name — stored on-chain as bytes32.
-            # Anyone can verify by hashing the known model identifier.
-            model_hash = Web3.keccak(text=model) if model else b"\x00" * 32
+            metrics_hash = "0x" + hashlib.sha256(metrics_json.encode()).hexdigest()
+            model_hash = "0x" + hashlib.sha256(model.encode()).hexdigest() if model else "0x" + "00" * 32
 
             with self._lock:
-                self._pending_attestations.append(
-                    {
-                        "tool_calls": tool_calls,
-                        "tool_errors": tool_errors,
-                        "duration": duration,
-                        "completed": completed,
-                        "model_hash": model_hash,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "metrics_hash": metrics_hash,
-                    }
-                )
+                self._pending_attestations.append({
+                    "tool_calls": tool_calls,
+                    "tool_errors": tool_errors,
+                    "duration": duration,
+                    "completed": completed,
+                    "model_hash": model_hash,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "metrics_hash": metrics_hash,
+                })
                 should_flush = (
                     len(self._pending_attestations) >= self._batch_size_threshold
                     or time.time() - self._last_flush_time >= self._batch_time_threshold
@@ -233,30 +204,10 @@ class InteractionTracker:
         except Exception as e:
             self._stats["errors"] += 1
             logger.warning("[agentscore] Attestation prep failed: %s", e)
-            if metrics_hash is not None:
-                self._save_pending_attestation(
-                    tool_calls=tool_calls,
-                    tool_errors=tool_errors,
-                    duration=duration,
-                    completed=completed,
-                    model_hash=model_hash.hex() if model_hash and hasattr(model_hash, "hex") else "00" * 32,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    metrics_hash=metrics_hash.hex(),
-                )
 
     def reap_stale(self, max_age: int = 3600) -> int:
-        """
-        Reap interactions that have been open longer than *max_age* seconds.
-
-        These represent sessions where agent:end was never fired (crash,
-        timeout, OOM, etc.).  They are attested as completed=False so the
-        on-chain record reflects the failure.
-
-        Returns the number of reaped interactions.
-        """
+        """Reap interactions open longer than max_age seconds."""
         now = time.time()
-        reaped = 0
         stale_ids: List[str] = []
 
         with self._lock:
@@ -264,11 +215,12 @@ class InteractionTracker:
                 if now - interaction["started_at"] > max_age:
                     stale_ids.append(sid)
 
+        reaped = 0
         for sid in stale_ids:
             self.on_end({
                 "session_id": sid,
                 "completed": False,
-                "error": "stale interaction reaped (no agent:end received)",
+                "error": "stale interaction reaped",
             })
             reaped += 1
 
@@ -276,28 +228,8 @@ class InteractionTracker:
             logger.info("[agentscore] Reaped %d stale interactions", reaped)
         return reaped
 
-    @staticmethod
-    def _to_hex(val) -> str:
-        """Convert bytes or str to hex string."""
-        if hasattr(val, "hex"):
-            return val.hex()
-        return str(val)
-
-    def _att_to_pending(self, att: Dict[str, Any]) -> None:
-        """Convert an in-memory attestation to a pending-file entry."""
-        self._save_pending_attestation(
-            tool_calls=att["tool_calls"],
-            tool_errors=att["tool_errors"],
-            duration=att["duration"],
-            completed=att["completed"],
-            model_hash=self._to_hex(att.get("model_hash", "00" * 32)),
-            input_tokens=att.get("input_tokens", 0),
-            output_tokens=att.get("output_tokens", 0),
-            metrics_hash=self._to_hex(att["metrics_hash"]),
-        )
-
     def _flush_batch(self) -> None:
-        """Flush pending attestations to chain as a batch."""
+        """Flush pending attestations to the relay server."""
         with self._lock:
             if not self._pending_attestations:
                 return
@@ -309,111 +241,76 @@ class InteractionTracker:
             return
 
         try:
-            tx_hash = self._chain.attest_batch(attestations)
+            result = self._sdk.attest_batch(attestations)
             self._stats["attested"] += len(attestations)
+            tx_hash = result.get("txHash", "unknown")
             logger.info(
                 "[agentscore] Batch attested: %d attestations tx=%s",
                 len(attestations),
-                tx_hash[:16],
+                tx_hash[:16] if len(tx_hash) > 16 else tx_hash,
             )
         except Exception as e:
             self._stats["errors"] += 1
             logger.warning("[agentscore] Batch attestation failed: %s", e)
-            for att in attestations:
-                self._att_to_pending(att)
 
     def flush(self) -> None:
         """Public method to flush pending attestations. Called on shutdown."""
         self._flush_batch()
 
-        with self._lock:
-            if self._pending_attestations:
-                logger.info(
-                    "[agentscore] Persisting %d unflushed attestations on shutdown",
-                    len(self._pending_attestations),
-                )
-                for att in self._pending_attestations:
-                    self._att_to_pending(att)
-                self._pending_attestations = []
 
-    def _save_pending_attestation(
-        self,
-        tool_calls: int,
-        tool_errors: int,
-        duration: int,
-        completed: bool,
-        model_hash: str,
-        input_tokens: int,
-        output_tokens: int,
-        metrics_hash: str,
-    ) -> None:
-        """Save a failed attestation to the pending queue for retry."""
-        from .chain import load_pending_attestations, save_pending_attestations
-
-        pending = load_pending_attestations()
-        pending.append(
-            {
-                "tool_calls": tool_calls,
-                "tool_errors": tool_errors,
-                "duration": duration,
-                "completed": completed,
-                "model_hash": model_hash,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "metrics_hash": metrics_hash,
-                "timestamp": int(time.time()),
-            }
-        )
-        save_pending_attestations(pending)
-        logger.info("[agentscore] Saved failed attestation to pending queue")
-
-
-def create_tracker(network: str = "base-sepolia") -> Optional[InteractionTracker]:
+def create_tracker(
+    server_url: str = "http://localhost:8000",
+) -> Optional[InteractionTracker]:
     """
-    Create a tracker with chain client.
+    Create a tracker connected to the AgentScore relay server.
 
-    Returns None if web3 is not installed or chain connection fails.
-    Gracefully degrades — the gateway runs fine without it.
+    The agent's identity (address) comes from ~/.agentscore/agent.key.
+    Registration is handled via the relay (gas-free).
     """
-    chain = None
+    sdk = None
     try:
-        from .chain import AgentScoreChain, retry_pending_attestations
+        import requests  # noqa: F401 — verify requests is available
+        from .identity import ensure_identity, get_wallet_provider
 
-        chain = AgentScoreChain(network=network)
-        if chain.is_ready():
+        _, agent_address = ensure_identity()
+        wallet_type = get_wallet_provider()
+
+        try:
+            from agentscore_sdk import AgentScoreClient
+        except ImportError:
+            from ._sdk_client import AgentScoreClient
+
+        sdk = AgentScoreClient(
+            server_url=server_url,
+            agent_address=agent_address,
+        )
+
+        # Register if not already registered (gas-free via relay)
+        try:
+            sdk.get_profile()
             logger.info(
-                "[agentscore] Connected to %s. Agent: %s",
-                network,
-                chain.address,
+                "[agentscore] Connected to %s. Agent: %s (wallet: %s)",
+                server_url, agent_address, wallet_type,
             )
-            # Retry any pending attestations from previous failed sessions.
+        except Exception:
             try:
-                retried = retry_pending_attestations(chain)
-                if retried > 0:
-                    logger.info("[agentscore] Retried %d pending attestations", retried)
+                sdk.register()
+                logger.info(
+                    "[agentscore] Registered agent %s via relay (wallet: %s)",
+                    agent_address, wallet_type,
+                )
             except Exception as e:
-                logger.warning("[agentscore] Pending retry failed: %s", e)
-            # Auto-register if needed.
-            if not chain.is_registered():
-                try:
-                    tx = chain.register()
-                    logger.info("[agentscore] Registered on-chain: %s", tx)
-                except Exception as e:
-                    logger.warning("[agentscore] Registration failed: %s", e)
-        else:
-            logger.info(
-                "[agentscore] Chain not ready (no contract address). "
-                "Running in offline mode."
-            )
-    except ImportError:
+                logger.warning("[agentscore] Registration failed: %s", e)
+
+    except ImportError as e:
         logger.info(
-            "[agentscore] web3 not installed. "
-            "Install with: pip install web3  — running in offline mode."
+            "[agentscore] Missing dependency (%s). "
+            "Install with: pip install requests — running in offline mode.", e
         )
     except Exception as e:
         logger.warning("[agentscore] Init error: %s", e)
 
-    return InteractionTracker(chain_client=chain)
+    return InteractionTracker(sdk_client=sdk)
 
 
 def setup_shutdown_handler(tracker: InteractionTracker) -> None:
@@ -428,4 +325,4 @@ def setup_shutdown_handler(tracker: InteractionTracker) -> None:
     try:
         signal.signal(signal.SIGTERM, flush_handler)
     except (ValueError, OSError):
-        pass  # Not supported on this platform
+        pass

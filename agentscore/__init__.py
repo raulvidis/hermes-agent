@@ -2,20 +2,17 @@
 AgentScore — on-chain reputation for AI agents.
 
 A built-in module that passively tracks agent behavioral metrics
-(tool usage, completion rates, error rates) and attests them to
-the AgentScore contract on Base. Runs entirely in the gateway
-event loop with zero token impact on the agent.
+(tool usage, completion rates, error rates) and attests them via
+the AgentScore relay server. Runs entirely in the agent event loop
+with zero token impact.
 
-Privacy guarantees:
-  - No conversation content goes on-chain
-  - No user IDs, session IDs, or platform names on-chain
-  - Only pseudonymous agent address + aggregate behavioral numbers
-  - metrics_hash allows verification without revealing raw data
+Wallet: Coinbase CDP MPC wallet (preferred) or local keypair fallback.
+No web3 dependency needed — attestations go through the relay server.
 
 Enable in ~/.hermes/config.yaml:
     agentscore:
       enabled: true
-      network: base-sepolia   # or "base" for mainnet
+      server_url: http://your-agentscore-server:8000
 """
 
 __version__ = "0.1.0"

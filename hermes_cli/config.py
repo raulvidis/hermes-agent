@@ -206,13 +206,13 @@ DEFAULT_CONFIG = {
     # Or dict format: {"name": {"description": "...", "system_prompt": "...", "tone": "...", "style": "..."}}
     "personalities": {},
 
-    # AgentScore — on-chain reputation tracking.  When enabled, the gateway
+    # AgentScore — on-chain reputation tracking.  When enabled, the agent
     # passively records behavioral metrics (tool usage, completion rates) and
-    # attests them to the AgentScore contract on Base.  Zero token impact.
-    # Requires: pip install web3
+    # attests them via the AgentScore relay server.  Zero token impact.
+    # No web3 dependency — just needs the relay server URL.
     "agentscore": {
         "enabled": False,
-        "network": "base-sepolia",   # "base-sepolia" (testnet) or "base" (mainnet)
+        "server_url": "http://localhost:8000",
     },
 
     # Config schema version - bump this when adding new required fields

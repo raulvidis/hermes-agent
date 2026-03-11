@@ -641,7 +641,7 @@ class AIAgent:
             if _as_cfg.get("enabled"):
                 from agentscore.tracker import create_tracker, setup_shutdown_handler
                 self._agentscore_tracker = create_tracker(
-                    network=_as_cfg.get("network", "base-sepolia"),
+                    server_url=_as_cfg.get("server_url", "http://localhost:8000"),
                 )
                 setup_shutdown_handler(self._agentscore_tracker)
                 if not self.quiet_mode:
