@@ -3489,19 +3489,15 @@ class GatewayRunner:
             # delete the preview — avoids the visual "flash" (OpenClaw pattern).
             if _preview_msg_ids_to_delete:
                 _adapter = self.adapters.get(source.platform)
-                _chat = int(source.chat_id)
-
-                async def _deferred_delete():
-                    await asyncio.sleep(0.3)  # Let base.py send the final message
+                if _adapter:
+                    _chat = int(source.chat_id)
                     for mid in _preview_msg_ids_to_delete:
                         try:
-                            if _adapter and hasattr(_adapter, '_bot') and _adapter._bot:
-                                await _adapter._bot.delete_message(chat_id=_chat, message_id=mid)
+                            await _adapter.delete_message(chat_id=str(_chat), message_id=mid)
                         except Exception as e:
-                            logger.debug("Deferred preview delete failed (msg %s): %s", mid, e)
-
-                _cleanup_task = asyncio.create_task(_deferred_delete())
-                _cleanup_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+                            logger.debug("Preview delete failed (msg %s): %s", mid, e)
+                else:
+                    logger.debug("No adapter for platform %s, skipping preview cleanup", source.platform)
 
         return response
 

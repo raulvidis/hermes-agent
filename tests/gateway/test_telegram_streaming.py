@@ -60,6 +60,8 @@ def test_discard_stream_returns_message_id_without_flushing():
     assert mid == 303
     # The "should not be sent" text should NOT have been flushed
     for call in bot.send_message.await_args_list:
-        assert "should not be sent" not in str(call)
+        text = call.kwargs.get("text", "")
+        assert "should not be sent" not in text
     for call in getattr(bot, 'edit_message_text', AsyncMock()).await_args_list:
-        assert "should not be sent" not in str(call)
+        text = call.kwargs.get("text", "")
+        assert "should not be sent" not in text

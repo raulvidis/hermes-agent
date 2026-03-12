@@ -525,6 +525,11 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] Failed to delete stream preview: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def delete_message(self, chat_id: str, message_id: int) -> None:
+        """Delete a message by ID."""
+        if self._bot:
+            await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
+
     @property
     def streaming_enabled(self) -> bool:
         """Check if streaming is enabled for this adapter."""
