@@ -3007,6 +3007,7 @@ class GatewayRunner:
 
         _stream_metadata = {"thread_id": source.thread_id} if source.thread_id else None
         _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _preview_msg_ids_to_delete: list[int] = []  # Filled on cancel, deleted after final send
 
         def _compose_stream_answer(answer_text: str, progress_lines: list[str]) -> str:
             answer_text = (answer_text or "").strip()
@@ -3089,16 +3090,17 @@ class GatewayRunner:
                 except asyncio.TimeoutError:
                     await _flush_latest()
                 except asyncio.CancelledError:
-                    # Delete streaming preview messages — the final formatted
-                    # response will be sent by the normal base.py send path.
-                    # This matches OpenClaw's approach: preview is temporary.
+                    # Discard streams without flushing or deleting yet.
+                    # Stash message IDs so they can be deleted AFTER the
+                    # final response is sent (avoids visual flash).
                     for lane in [StreamLane.ANSWER, StreamLane.REASONING]:
                         if stream_started[lane]:
                             try:
-                                await adapter.stream_delete(
-                                    chat_id=source.chat_id,
-                                    lane=lane,
+                                mid = await adapter._streaming_manager.discard_stream(
+                                    int(source.chat_id), lane,
                                 )
+                                if mid:
+                                    _preview_msg_ids_to_delete.append(mid)
                             except Exception:
                                 pass
                     return
@@ -3480,7 +3482,25 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
-        
+
+            # Schedule deferred deletion of streaming preview messages.
+            # Delay so base.py sends the final response first, then we
+            # delete the preview — avoids the visual "flash" (OpenClaw pattern).
+            if _preview_msg_ids_to_delete:
+                _adapter = self.adapters.get(source.platform)
+                _chat = int(source.chat_id)
+
+                async def _deferred_delete():
+                    await asyncio.sleep(1.5)  # Let base.py send the final message
+                    for mid in _preview_msg_ids_to_delete:
+                        try:
+                            if _adapter and hasattr(_adapter, '_bot') and _adapter._bot:
+                                await _adapter._bot.delete_message(chat_id=_chat, message_id=mid)
+                        except Exception:
+                            pass
+
+                asyncio.create_task(_deferred_delete())
+
         return response
 
 
