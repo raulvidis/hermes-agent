@@ -229,7 +229,6 @@ class GatewayRunner:
         self._prefill_messages = self._load_prefill_messages()
         self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
         self._reasoning_config = self._load_reasoning_config()
-        self._show_reasoning = self._load_show_reasoning()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
@@ -251,12 +250,6 @@ class GatewayRunner:
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str}
         self._pending_approvals: Dict[str, Dict[str, str]] = {}
-
-        # Persistent Honcho managers keyed by gateway session key.
-        # This preserves write_frequency="session" semantics across short-lived
-        # per-message AIAgent instances.
-        self._honcho_managers: Dict[str, Any] = {}
-        self._honcho_configs: Dict[str, Any] = {}
         
         # Initialize session database for session_search tool support
         self._session_db = None
@@ -273,61 +266,6 @@ class GatewayRunner:
         # Event hook system
         from gateway.hooks import HookRegistry
         self.hooks = HookRegistry()
-
-    def _get_or_create_gateway_honcho(self, session_key: str):
-        """Return a persistent Honcho manager/config pair for this gateway session."""
-        if not hasattr(self, "_honcho_managers"):
-            self._honcho_managers = {}
-        if not hasattr(self, "_honcho_configs"):
-            self._honcho_configs = {}
-
-        if session_key in self._honcho_managers:
-            return self._honcho_managers[session_key], self._honcho_configs.get(session_key)
-
-        try:
-            from honcho_integration.client import HonchoClientConfig, get_honcho_client
-            from honcho_integration.session import HonchoSessionManager
-
-            hcfg = HonchoClientConfig.from_global_config()
-            if not hcfg.enabled or not hcfg.api_key:
-                return None, hcfg
-
-            client = get_honcho_client(hcfg)
-            manager = HonchoSessionManager(
-                honcho=client,
-                config=hcfg,
-                context_tokens=hcfg.context_tokens,
-            )
-            self._honcho_managers[session_key] = manager
-            self._honcho_configs[session_key] = hcfg
-            return manager, hcfg
-        except Exception as e:
-            logger.debug("Gateway Honcho init failed for %s: %s", session_key, e)
-            return None, None
-
-    def _shutdown_gateway_honcho(self, session_key: str) -> None:
-        """Flush and close the persistent Honcho manager for a gateway session."""
-        managers = getattr(self, "_honcho_managers", None)
-        configs = getattr(self, "_honcho_configs", None)
-        if managers is None or configs is None:
-            return
-
-        manager = managers.pop(session_key, None)
-        configs.pop(session_key, None)
-        if not manager:
-            return
-        try:
-            manager.shutdown()
-        except Exception as e:
-            logger.debug("Gateway Honcho shutdown failed for %s: %s", session_key, e)
-
-    def _shutdown_all_gateway_honcho(self) -> None:
-        """Flush and close all persistent Honcho managers."""
-        managers = getattr(self, "_honcho_managers", None)
-        if not managers:
-            return
-        for session_key in list(managers.keys()):
-            self._shutdown_gateway_honcho(session_key)
     
     def _flush_memories_for_session(self, old_session_id: str):
         """Prompt the agent to save memories/skills before context is lost.
@@ -386,12 +324,6 @@ class GatewayRunner:
                 conversation_history=msgs,
             )
             logger.info("Pre-reset memory flush completed for session %s", old_session_id)
-            # Flush any queued Honcho writes before the session is dropped
-            if getattr(tmp_agent, '_honcho', None):
-                try:
-                    tmp_agent._honcho.shutdown()
-                except Exception:
-                    pass
         except Exception as e:
             logger.debug("Pre-reset memory flush failed for session %s: %s", old_session_id, e)
 
@@ -489,20 +421,6 @@ class GatewayRunner:
             return {"enabled": True, "effort": effort}
         logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
         return None
-
-    @staticmethod
-    def _load_show_reasoning() -> bool:
-        """Load show_reasoning toggle from config.yaml display section."""
-        try:
-            import yaml as _y
-            cfg_path = _hermes_home / "config.yaml"
-            if cfg_path.exists():
-                with open(cfg_path, encoding="utf-8") as _f:
-                    cfg = _y.safe_load(_f) or {}
-                return bool(cfg.get("display", {}).get("show_reasoning", False))
-        except Exception:
-            pass
-        return False
 
     @staticmethod
     def _load_background_notifications_mode() -> str:
@@ -702,7 +620,6 @@ class GatewayRunner:
                     )
                     try:
                         await self._async_flush_memories(entry.session_id)
-                        self._shutdown_gateway_honcho(key)
                         self.session_store._pre_flushed_sessions.add(entry.session_id)
                     except Exception as e:
                         logger.debug("Proactive memory flush failed for %s: %s", entry.session_id, e)
@@ -725,9 +642,8 @@ class GatewayRunner:
                 logger.info("✓ %s disconnected", platform.value)
             except Exception as e:
                 logger.error("✗ %s disconnect error: %s", platform.value, e)
-
+        
         self.adapters.clear()
-        self._shutdown_all_gateway_honcho()
         self._shutdown_event.set()
         
         from gateway.status import remove_pid_file
@@ -931,7 +847,7 @@ class GatewayRunner:
                           "personality", "retry", "undo", "sethome", "set-home",
                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
                           "update", "title", "resume", "provider", "rollback",
-                          "background", "reasoning"}
+                          "background"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -996,9 +912,6 @@ class GatewayRunner:
 
         if command == "background":
             return await self._handle_background_command(event)
-
-        if command == "reasoning":
-            return await self._handle_reasoning_command(event)
         
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -1034,9 +947,7 @@ class GatewayRunner:
                 cmd_key = f"/{command}"
                 if cmd_key in skill_cmds:
                     user_instruction = event.get_command_args().strip()
-                    msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=session_key
-                    )
+                    msg = build_skill_invocation_message(cmd_key, user_instruction)
                     if msg:
                         event.text = msg
                         # Fall through to normal message processing with skill content
@@ -1060,10 +971,6 @@ class GatewayRunner:
             elif user_text in ("no", "n", "deny", "cancel", "nope"):
                 self._pending_approvals.pop(session_key_preview)
                 return "❌ Command denied."
-            elif user_text in ("full", "show", "view", "show full", "view full"):
-                # Show full command without consuming the approval
-                cmd = self._pending_approvals[session_key_preview]["command"]
-                return f"Full command:\n\n```\n{cmd}\n```\n\nReply yes/no to approve or deny."
             # If it's not clearly an approval/denial, fall through to normal processing
         
         # Get or create session
@@ -1129,7 +1036,7 @@ class GatewayRunner:
             # Read model + compression config from config.yaml — same
             # source of truth the agent itself uses.
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.50
+            _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
             try:
                 _hyg_cfg_path = _hermes_home / "config.yaml"
@@ -1446,20 +1353,7 @@ class GatewayRunner:
             
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
-
-            # Prepend reasoning/thinking if display is enabled
-            if getattr(self, "_show_reasoning", False) and response:
-                last_reasoning = agent_result.get("last_reasoning")
-                if last_reasoning:
-                    # Collapse long reasoning to keep messages readable
-                    lines = last_reasoning.strip().splitlines()
-                    if len(lines) > 15:
-                        display_reasoning = "\n".join(lines[:15])
-                        display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
-                    else:
-                        display_reasoning = last_reasoning.strip()
-                    response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
-
+            
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
@@ -1575,8 +1469,6 @@ class GatewayRunner:
                 asyncio.create_task(self._async_flush_memories(old_entry.session_id))
         except Exception as e:
             logger.debug("Gateway memory flush on reset failed: %s", e)
-
-        self._shutdown_gateway_honcho(session_key)
         
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
@@ -1652,7 +1544,6 @@ class GatewayRunner:
             "`/resume [name]` — Resume a previously-named session",
             "`/usage` — Show token usage for this session",
             "`/insights [days]` — Show usage insights and analytics",
-            "`/reasoning [level|show|hide]` — Set reasoning effort or toggle display",
             "`/rollback [number]` — List or restore filesystem checkpoints",
             "`/background <prompt>` — Run a prompt in a separate background session",
             "`/reload-mcp` — Reload MCP servers from config",
@@ -1685,7 +1576,7 @@ class GatewayRunner:
         config_path = _hermes_home / 'config.yaml'
 
         # Resolve current model and provider from config
-        current = os.getenv("HERMES_MODEL") or "anthropic/claude-opus-4.6"
+        current = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
         current_provider = "openrouter"
         try:
             if config_path.exists():
@@ -2280,88 +2171,6 @@ class GatewayRunner:
             except Exception:
                 pass
 
-    async def _handle_reasoning_command(self, event: MessageEvent) -> str:
-        """Handle /reasoning command — manage reasoning effort and display toggle.
-
-        Usage:
-            /reasoning              Show current effort level and display state
-            /reasoning <level>      Set reasoning effort (none, low, medium, high, xhigh)
-            /reasoning show|on      Show model reasoning in responses
-            /reasoning hide|off     Hide model reasoning from responses
-        """
-        import yaml
-
-        args = event.get_command_args().strip().lower()
-        config_path = _hermes_home / "config.yaml"
-
-        def _save_config_key(key_path: str, value):
-            """Save a dot-separated key to config.yaml."""
-            try:
-                user_config = {}
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
-                keys = key_path.split(".")
-                current = user_config
-                for k in keys[:-1]:
-                    if k not in current or not isinstance(current[k], dict):
-                        current[k] = {}
-                    current = current[k]
-                current[keys[-1]] = value
-                with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
-                return True
-            except Exception as e:
-                logger.error("Failed to save config key %s: %s", key_path, e)
-                return False
-
-        if not args:
-            # Show current state
-            rc = self._reasoning_config
-            if rc is None:
-                level = "medium (default)"
-            elif rc.get("enabled") is False:
-                level = "none (disabled)"
-            else:
-                level = rc.get("effort", "medium")
-            display_state = "on ✓" if self._show_reasoning else "off"
-            return (
-                "🧠 **Reasoning Settings**\n\n"
-                f"**Effort:** `{level}`\n"
-                f"**Display:** {display_state}\n\n"
-                "_Usage:_ `/reasoning <none|low|medium|high|xhigh|show|hide>`"
-            )
-
-        # Display toggle
-        if args in ("show", "on"):
-            self._show_reasoning = True
-            _save_config_key("display.show_reasoning", True)
-            return "🧠 ✓ Reasoning display: **ON**\nModel thinking will be shown before each response."
-
-        if args in ("hide", "off"):
-            self._show_reasoning = False
-            _save_config_key("display.show_reasoning", False)
-            return "🧠 ✓ Reasoning display: **OFF**"
-
-        # Effort level change
-        effort = args.strip()
-        if effort == "none":
-            parsed = {"enabled": False}
-        elif effort in ("xhigh", "high", "medium", "low", "minimal"):
-            parsed = {"enabled": True, "effort": effort}
-        else:
-            return (
-                f"⚠️ Unknown argument: `{effort}`\n\n"
-                "**Valid levels:** none, low, minimal, medium, high, xhigh\n"
-                "**Display:** show, hide"
-            )
-
-        self._reasoning_config = parsed
-        if _save_config_key("agent.reasoning_effort", effort):
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (saved to config)\n_(takes effect on next message)_"
-        else:
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
-
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context."""
         source = event.source
@@ -2508,8 +2317,6 @@ class GatewayRunner:
             asyncio.create_task(self._async_flush_memories(current_entry.session_id))
         except Exception as e:
             logger.debug("Memory flush on resume failed: %s", e)
-
-        self._shutdown_gateway_honcho(session_key)
 
         # Clear any running agent for this session key
         if session_key in self._running_agents:
@@ -3106,24 +2913,30 @@ class GatewayRunner:
             or "all"
         )
         tool_progress_enabled = progress_mode != "off"
-        
-        # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
-        last_tool = [None]  # Mutable container for tracking in closure
-        last_progress_msg = [None]  # Track last message for dedup
-        repeat_count = [0]  # How many times the same message repeated
-        
+        callback_loop = asyncio.get_running_loop()
+        telegram_stream_progress = source.platform in {Platform.TELEGRAM, Platform.TELEGRAM.value}
+
+        progress_queue: Optional[asyncio.Queue[str]] = asyncio.Queue() if tool_progress_enabled else None
+        streaming_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        last_tool = [None]
+
+        def _queue_put_threadsafe(target_queue, item) -> None:
+            if target_queue is None:
+                return
+            try:
+                callback_loop.call_soon_threadsafe(target_queue.put_nowait, item)
+            except RuntimeError:
+                pass
+
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             """Callback invoked by agent when a tool is called."""
-            if not progress_queue:
+            if not tool_progress_enabled:
                 return
-            
-            # "new" mode: only report when tool changes
+
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+
             tool_emojis = {
                 "terminal": "💻",
                 "process": "⚙️",
@@ -3165,130 +2978,125 @@ class GatewayRunner:
                 "skill_manage": "📝",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
-            
-            # Verbose mode: show detailed arguments
+
             if progress_mode == "verbose" and args:
                 import json as _json
+
                 args_str = _json.dumps(args, ensure_ascii=False, default=str)
                 if len(args_str) > 200:
                     args_str = args_str[:197] + "..."
                 msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                progress_queue.put(msg)
-                return
-            
-            if preview:
-                # Truncate preview to keep messages clean
+            elif preview:
                 if len(preview) > 80:
                     preview = preview[:77] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                msg = f'{emoji} {tool_name}: "{preview}"'
             else:
                 msg = f"{emoji} {tool_name}..."
-            
-            # Dedup: collapse consecutive identical progress messages.
-            # Common with execute_code where models iterate with the same
-            # code (same boilerplate imports → identical previews).
-            if msg == last_progress_msg[0]:
-                repeat_count[0] += 1
-                # Update the last line in progress_lines with a counter
-                # via a special "dedup" queue message.
-                progress_queue.put(("__dedup__", msg, repeat_count[0]))
-                return
-            last_progress_msg[0] = msg
-            repeat_count[0] = 0
-            
-            progress_queue.put(msg)
-        
-        # ── Streaming support for real-time reasoning updates ──────────────────────
-        # Queue for streaming text updates (thread-safe)
-        streaming_queue = queue.Queue()
-        streaming_text = [""]  # Mutable container for accumulated text
-        streaming_reasoning = [""]  # Mutable container for reasoning text
-        
+
+            if telegram_stream_progress:
+                _queue_put_threadsafe(streaming_queue, ("progress", msg))
+            else:
+                _queue_put_threadsafe(progress_queue, msg)
+
         def streaming_callback(text: str, is_reasoning: bool = False):
             """Callback invoked by agent when streaming text is available."""
-            if is_reasoning:
-                streaming_reasoning[0] = text
-            else:
-                streaming_text[0] = text
-            streaming_queue.put(("reasoning" if is_reasoning else "text", text))
-        
+            _queue_put_threadsafe(streaming_queue, ("reasoning" if is_reasoning else "text", text or ""))
+
         def reasoning_stream_callback(text: str):
-            """Callback for reasoning/thinking content."""
             streaming_callback(text, is_reasoning=True)
-        
-        # Background task to send streaming updates
+
         _stream_metadata = {"thread_id": source.thread_id} if source.thread_id else None
-        
+        _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+
+        def _compose_stream_answer(answer_text: str, progress_lines: list[str]) -> str:
+            answer_text = (answer_text or "").strip()
+            if not progress_lines:
+                return answer_text
+            progress_block = "\n".join(progress_lines)
+            if answer_text:
+                return f"Running:\n{progress_block}\n\n{answer_text}"
+            return f"Running:\n{progress_block}"
+
         async def send_streaming_updates():
             """Background task that updates the streaming message."""
             adapter = self.adapters.get(source.platform)
-            if not adapter:
+            if not adapter or not getattr(adapter, "streaming_enabled", False):
                 return
-            
-            # Check if adapter supports streaming
-            if not hasattr(adapter, 'streaming_enabled') or not adapter.streaming_enabled:
-                return
-            
-            stream_msg_id = {StreamLane.ANSWER: None, StreamLane.REASONING: None}  # Message IDs per lane
-            last_sent = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}  # Last sent text per lane
-            min_update_interval = 1.0  # Minimum seconds between updates (throttle)
-            last_update_time = [0]
-            
-            while True:
-                try:
-                    update_type, text = streaming_queue.get(timeout=0.5)
-                    lane = StreamLane.REASONING if update_type == "reasoning" else StreamLane.ANSWER
-                    
-                    # Skip if text hasn't changed significantly
-                    if abs(len(text) - len(last_sent[lane])) < 20 and text == last_sent[lane]:
+
+            stream_started = {StreamLane.ANSWER: False, StreamLane.REASONING: False}
+            latest_text = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}
+            progress_lines: list[str] = []
+            min_update_interval = 1.0
+            last_update_time = 0.0
+
+            async def _flush_latest(force: bool = False):
+                nonlocal last_update_time
+                answer_payload = _compose_stream_answer(latest_text[StreamLane.ANSWER], progress_lines)
+                pending_payloads = {
+                    StreamLane.ANSWER: answer_payload,
+                    StreamLane.REASONING: latest_text[StreamLane.REASONING].strip(),
+                }
+
+                now = callback_loop.time()
+                if not force and (now - last_update_time) < min_update_interval:
+                    return
+                last_update_time = now
+
+                for lane, payload in pending_payloads.items():
+                    if not payload:
                         continue
-                    
-                    # Throttle updates
-                    now = asyncio.get_event_loop().time()
-                    if now - last_update_time[0] < min_update_interval:
-                        continue
-                    
-                    last_update_time[0] = now
-                    last_sent[lane] = text
-                    
-                    # Format text for display
-                    if lane == StreamLane.REASONING:
-                        display_text = f"<i>{text}</i>" if text else ""
-                    else:
-                        display_text = text
-                    
-                    # Update or create the stream
-                    if stream_msg_id[lane] is None:
-                        # Start new stream
+                    if not stream_started[lane]:
                         result = await adapter.stream_start(
                             chat_id=source.chat_id,
-                            initial_text=display_text,
+                            initial_text=payload,
                             thread_id=source.thread_id,
                             lane=lane,
                         )
-                        if result.success and result.raw_response:
-                            stream_msg_id[lane] = result.raw_response.get("stream_key")
+                        stream_started[lane] = bool(result.success)
                     else:
-                        # Update existing stream
                         await adapter.stream_update(
                             chat_id=source.chat_id,
-                            text=display_text,
+                            text=payload,
                             lane=lane,
                         )
-                    
-                    # Restore typing indicator
-                    await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
-                    
-                except queue.Empty:
-                    await asyncio.sleep(0.3)
+
+                await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
+
+            while True:
+                try:
+                    update_type, text = await asyncio.wait_for(streaming_queue.get(), timeout=0.5)
+
+                    if update_type == "progress":
+                        progress_lines.append(text)
+                    elif update_type == "reasoning":
+                        latest_text[StreamLane.REASONING] = text
+                    else:
+                        latest_text[StreamLane.ANSWER] = text
+
+                    while True:
+                        try:
+                            update_type, text = streaming_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if update_type == "progress":
+                            progress_lines.append(text)
+                        elif update_type == "reasoning":
+                            latest_text[StreamLane.REASONING] = text
+                        else:
+                            latest_text[StreamLane.ANSWER] = text
+
+                    await _flush_latest()
+                except asyncio.TimeoutError:
+                    await _flush_latest()
                 except asyncio.CancelledError:
-                    # Finalize streams on cancel
+                    await _flush_latest(force=True)
                     for lane in [StreamLane.ANSWER, StreamLane.REASONING]:
-                        if stream_msg_id[lane]:
+                        if stream_started[lane]:
                             try:
+                                final_text = _compose_stream_answer(latest_text[lane], progress_lines) if lane == StreamLane.ANSWER else latest_text[lane].strip()
                                 await adapter.stream_end(
                                     chat_id=source.chat_id,
-                                    final_text=last_sent[lane],
+                                    final_text=final_text,
                                     lane=lane,
                                 )
                             except Exception:
@@ -3297,10 +3105,6 @@ class GatewayRunner:
                 except Exception as e:
                     logger.debug("Streaming update error: %s", e)
                     await asyncio.sleep(0.5)
-        
-        # Background task to send progress messages
-        # Accumulates tool lines into a single message that gets edited
-        _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
 
         async def send_progress_messages():
             if not progress_queue:
@@ -3310,26 +3114,16 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            progress_lines = []      # Accumulated tool lines
-            progress_msg_id = None   # ID of the progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
+            progress_lines = []
+            progress_msg_id = None
+            can_edit = True
 
             while True:
                 try:
-                    raw = progress_queue.get_nowait()
-                    
-                    # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                        _, base_msg, count = raw
-                        if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                        msg = progress_lines[-1] if progress_lines else base_msg
-                    else:
-                        msg = raw
-                        progress_lines.append(msg)
+                    msg = await asyncio.wait_for(progress_queue.get(), timeout=0.3)
+                    progress_lines.append(msg)
 
                     if can_edit and progress_msg_id is not None:
-                        # Try to edit the existing progress message
                         full_text = "\n".join(progress_lines)
                         result = await adapter.edit_message(
                             chat_id=source.chat_id,
@@ -3337,48 +3131,30 @@ class GatewayRunner:
                             content=full_text,
                         )
                         if not result.success:
-                            # Platform doesn't support editing — stop trying,
-                            # send just this new line as a separate message
                             can_edit = False
                             await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                     else:
-                        if can_edit:
-                            # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
-                        else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                        full_text = "\n".join(progress_lines) if can_edit else msg
+                        result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
-                    # Restore typing indicator
                     await asyncio.sleep(0.3)
                     await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
-
-                except queue.Empty:
-                    await asyncio.sleep(0.3)
+                except asyncio.TimeoutError:
+                    continue
                 except asyncio.CancelledError:
-                    # Drain remaining queued messages
-                    while not progress_queue.empty():
+                    while True:
                         try:
-                            raw = progress_queue.get_nowait()
-                            if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                                _, base_msg, count = raw
-                                if progress_lines:
-                                    progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                            else:
-                                progress_lines.append(raw)
-                        except Exception:
+                            progress_lines.append(progress_queue.get_nowait())
+                        except asyncio.QueueEmpty:
                             break
-                    # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
                                 message_id=progress_msg_id,
-                                content=full_text,
+                                content="\n".join(progress_lines),
                             )
                         except Exception:
                             pass
@@ -3386,7 +3162,7 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
-        
+
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
@@ -3450,7 +3226,6 @@ class GatewayRunner:
                 }
 
             pr = self._provider_routing
-            honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
             agent = AIAgent(
                 model=model,
                 **runtime_kwargs,
@@ -3474,8 +3249,6 @@ class GatewayRunner:
                 reasoning_callback=reasoning_stream_callback,
                 platform=platform_key,
                 honcho_session_key=session_key,
-                honcho_manager=honcho_manager,
-                honcho_config=honcho_config,
                 session_db=self._session_db,
                 fallback_model=self._fallback_model,
             )
@@ -3600,7 +3373,6 @@ class GatewayRunner:
             
             return {
                 "final_response": final_response,
-                "last_reasoning": result.get("last_reasoning"),
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
@@ -3630,19 +3402,17 @@ class GatewayRunner:
         # Monitor for interrupts from the adapter (new messages arriving)
         async def monitor_for_interrupt():
             adapter = self.adapters.get(source.platform)
-            if not adapter or not session_key:
+            if not adapter:
                 return
             
+            chat_id = source.chat_id
             while True:
                 await asyncio.sleep(0.2)  # Check every 200ms
-                # Check if adapter has a pending interrupt for this session.
-                # Must use session_key (build_session_key output) — NOT
-                # source.chat_id — because the adapter stores interrupt events
-                # under the full session key.
-                if hasattr(adapter, 'has_pending_interrupt') and adapter.has_pending_interrupt(session_key):
+                # Check if adapter has a pending interrupt for this session
+                if hasattr(adapter, 'has_pending_interrupt') and adapter.has_pending_interrupt(chat_id):
                     agent = agent_holder[0]
                     if agent:
-                        pending_event = adapter.get_pending_message(session_key)
+                        pending_event = adapter.get_pending_message(chat_id)
                         pending_text = pending_event.text if pending_event else None
                         logger.debug("Interrupt detected from adapter, signaling agent...")
                         agent.interrupt(pending_text)
@@ -3659,11 +3429,10 @@ class GatewayRunner:
             result = result_holder[0]
             adapter = self.adapters.get(source.platform)
             
-            # Get pending message from adapter if interrupted.
-            # Use session_key (not source.chat_id) to match adapter's storage keys.
+            # Get pending message from adapter if interrupted
             pending = None
             if result and result.get("interrupted") and adapter:
-                pending_event = adapter.get_pending_message(session_key) if session_key else None
+                pending_event = adapter.get_pending_message(source.chat_id)
                 if pending_event:
                     pending = pending_event.text
                 elif result.get("interrupt_message"):
@@ -3675,8 +3444,8 @@ class GatewayRunner:
                 # Clear the adapter's interrupt event so the next _run_agent call
                 # doesn't immediately re-trigger the interrupt before the new agent
                 # even makes its first API call (this was causing an infinite loop).
-                if adapter and hasattr(adapter, '_active_sessions') and session_key and session_key in adapter._active_sessions:
-                    adapter._active_sessions[session_key].clear()
+                if adapter and hasattr(adapter, '_active_sessions') and source.chat_id in adapter._active_sessions:
+                    adapter._active_sessions[source.chat_id].clear()
                 
                 # Don't send the interrupted response to the user — it's just noise
                 # like "Operation interrupted." They already know they sent a new

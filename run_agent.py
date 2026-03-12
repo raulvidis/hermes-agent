@@ -2369,14 +2369,62 @@ class AIAgent:
             finish_reason = "stop"
         return assistant_message, finish_reason
 
+    def _emit_streaming_text(self, text: Optional[str], *, is_reasoning: bool = False) -> None:
+        """Best-effort bridge from provider stream events to UI callbacks."""
+        if not text:
+            return
+        try:
+            if is_reasoning:
+                if self.reasoning_callback:
+                    self.reasoning_callback(text)
+                elif self.streaming_callback:
+                    self.streaming_callback(text, True)
+            elif self.streaming_callback:
+                self.streaming_callback(text, False)
+        except Exception:
+            pass
+
+    def _consume_codex_stream_event(self, event, stream_state: dict) -> None:
+        """Extract answer/reasoning deltas from Codex Responses stream events."""
+        event_type = getattr(event, "type", None)
+        if not event_type and isinstance(event, dict):
+            event_type = event.get("type")
+        if not event_type:
+            return
+
+        def _get(*names):
+            for name in names:
+                value = getattr(event, name, None)
+                if value is None and isinstance(event, dict):
+                    value = event.get(name)
+                if value is not None:
+                    return value
+            return None
+
+        delta_text = _get("delta", "text")
+        if isinstance(delta_text, list):
+            delta_text = "".join(str(part) for part in delta_text if part is not None)
+        if not isinstance(delta_text, str):
+            delta_text = None
+
+        if "reasoning" in event_type and delta_text:
+            stream_state["reasoning"] += delta_text
+            self._emit_streaming_text(stream_state["reasoning"], is_reasoning=True)
+            return
+
+        if ("output_text" in event_type or event_type.endswith("text.delta")) and delta_text:
+            stream_state["answer"] += delta_text
+            self._emit_streaming_text(stream_state["answer"], is_reasoning=False)
+
     def _run_codex_stream(self, api_kwargs: dict):
         """Execute one streaming Responses API request and return the final response."""
         max_stream_retries = 1
         for attempt in range(max_stream_retries + 1):
+            stream_state = {"answer": "", "reasoning": ""}
             try:
                 with self.client.responses.stream(**api_kwargs) as stream:
-                    for _ in stream:
-                        pass
+                    for event in stream:
+                        self._consume_codex_stream_event(event, stream_state)
                     return stream.get_final_response()
             except RuntimeError as exc:
                 err_text = str(exc)
@@ -2409,8 +2457,10 @@ class AIAgent:
             return stream_or_response
 
         terminal_response = None
+        stream_state = {"answer": "", "reasoning": ""}
         try:
             for event in stream_or_response:
+                self._consume_codex_stream_event(event, stream_state)
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")

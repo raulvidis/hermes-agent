@@ -43,6 +43,13 @@ def adapter_factory():
     return create
 
 
+class TestAdapterBotAccessor:
+    def test_bot_property_returns_underlying_bot(self, adapter_factory):
+        adapter = adapter_factory()
+        adapter._bot = MagicMock(name="telegram-bot")
+        assert adapter.bot is adapter._bot
+
+
 class TestReplyToModeConfig:
     """Tests for reply_to_mode configuration loading."""
 
