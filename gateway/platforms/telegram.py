@@ -113,12 +113,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._bot: Optional[Bot] = None
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._streaming_manager: Optional[StreamingManager] = None
-        self._streaming_enabled: bool = getattr(config, 'streaming_enabled', True)
-
-    @property
-    def bot(self) -> Optional[Bot]:
-        """Expose the underlying bot for streaming helpers without leaking mutability."""
-        return self._bot
+        self._streaming_enabled: bool = getattr(config, 'streaming_enabled', False)
     
     async def connect(self) -> bool:
         """Connect to Telegram and start polling for updates."""

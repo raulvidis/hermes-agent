@@ -20,6 +20,7 @@ import re
 import sys
 import signal
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime
@@ -2913,30 +2914,22 @@ class GatewayRunner:
             or "all"
         )
         tool_progress_enabled = progress_mode != "off"
-        callback_loop = asyncio.get_running_loop()
-        telegram_stream_progress = source.platform in {Platform.TELEGRAM, Platform.TELEGRAM.value}
-
-        progress_queue: Optional[asyncio.Queue[str]] = asyncio.Queue() if tool_progress_enabled else None
-        streaming_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
-        last_tool = [None]
-
-        def _queue_put_threadsafe(target_queue, item) -> None:
-            if target_queue is None:
-                return
-            try:
-                callback_loop.call_soon_threadsafe(target_queue.put_nowait, item)
-            except RuntimeError:
-                pass
-
+        
+        # Queue for progress messages (thread-safe)
+        progress_queue = queue.Queue() if tool_progress_enabled else None
+        last_tool = [None]  # Mutable container for tracking in closure
+        
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             """Callback invoked by agent when a tool is called."""
-            if not tool_progress_enabled:
+            if not progress_queue:
                 return
-
+            
+            # "new" mode: only report when tool changes
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-
+            
+            # Build progress message with primary argument preview
             tool_emojis = {
                 "terminal": "💻",
                 "process": "⚙️",
@@ -2978,125 +2971,126 @@ class GatewayRunner:
                 "skill_manage": "📝",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
-
+            
+            # Verbose mode: show detailed arguments
             if progress_mode == "verbose" and args:
                 import json as _json
-
                 args_str = _json.dumps(args, ensure_ascii=False, default=str)
                 if len(args_str) > 200:
                     args_str = args_str[:197] + "..."
                 msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-            elif preview:
+                progress_queue.put(msg)
+                return
+            
+            if preview:
+                # Truncate preview to keep messages clean
                 if len(preview) > 80:
                     preview = preview[:77] + "..."
-                msg = f'{emoji} {tool_name}: "{preview}"'
+                msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
+            
+            progress_queue.put(msg)
+        
+        # ── Streaming support for real-time reasoning updates ──────────────────────
+        # Queue for streaming text updates (thread-safe)
+        streaming_queue = queue.Queue()
 
-            if telegram_stream_progress:
-                _queue_put_threadsafe(streaming_queue, ("progress", msg))
-            else:
-                _queue_put_threadsafe(progress_queue, msg)
-
-        def streaming_callback(text: str, is_reasoning: bool = False):
-            """Callback invoked by agent when streaming text is available."""
-            _queue_put_threadsafe(streaming_queue, ("reasoning" if is_reasoning else "text", text or ""))
+        def streaming_callback(text: str):
+            """Callback invoked by agent with accumulated answer text."""
+            streaming_queue.put(("text", text))
 
         def reasoning_stream_callback(text: str):
-            streaming_callback(text, is_reasoning=True)
+            """Callback for reasoning/thinking content."""
+            streaming_queue.put(("reasoning", text))
 
+        # Background task to send streaming updates
         _stream_metadata = {"thread_id": source.thread_id} if source.thread_id else None
-        _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
-
-        def _compose_stream_answer(answer_text: str, progress_lines: list[str]) -> str:
-            answer_text = (answer_text or "").strip()
-            if not progress_lines:
-                return answer_text
-            progress_block = "\n".join(progress_lines)
-            if answer_text:
-                return f"Running:\n{progress_block}\n\n{answer_text}"
-            return f"Running:\n{progress_block}"
 
         async def send_streaming_updates():
             """Background task that updates the streaming message."""
             adapter = self.adapters.get(source.platform)
-            if not adapter or not getattr(adapter, "streaming_enabled", False):
+            if not adapter:
                 return
 
-            stream_started = {StreamLane.ANSWER: False, StreamLane.REASONING: False}
-            latest_text = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}
-            progress_lines: list[str] = []
-            min_update_interval = 1.0
+            # Check if adapter supports streaming
+            if not hasattr(adapter, 'streaming_enabled') or not adapter.streaming_enabled:
+                return
+
+            loop = asyncio.get_running_loop()
+            stream_msg_id = {StreamLane.ANSWER: None, StreamLane.REASONING: None}
+            last_sent = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}
+            min_update_interval = 1.0  # Seconds between updates (throttle)
             last_update_time = 0.0
-
-            async def _flush_latest(force: bool = False):
-                nonlocal last_update_time
-                answer_payload = _compose_stream_answer(latest_text[StreamLane.ANSWER], progress_lines)
-                pending_payloads = {
-                    StreamLane.ANSWER: answer_payload,
-                    StreamLane.REASONING: latest_text[StreamLane.REASONING].strip(),
-                }
-
-                now = callback_loop.time()
-                if not force and (now - last_update_time) < min_update_interval:
-                    return
-                last_update_time = now
-
-                for lane, payload in pending_payloads.items():
-                    if not payload:
-                        continue
-                    if not stream_started[lane]:
-                        result = await adapter.stream_start(
-                            chat_id=source.chat_id,
-                            initial_text=payload,
-                            thread_id=source.thread_id,
-                            lane=lane,
-                        )
-                        stream_started[lane] = bool(result.success)
-                    else:
-                        await adapter.stream_update(
-                            chat_id=source.chat_id,
-                            text=payload,
-                            lane=lane,
-                        )
-
-                await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
 
             while True:
                 try:
-                    update_type, text = await asyncio.wait_for(streaming_queue.get(), timeout=0.5)
-
-                    if update_type == "progress":
-                        progress_lines.append(text)
-                    elif update_type == "reasoning":
-                        latest_text[StreamLane.REASONING] = text
-                    else:
-                        latest_text[StreamLane.ANSWER] = text
-
-                    while True:
-                        try:
-                            update_type, text = streaming_queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                        if update_type == "progress":
-                            progress_lines.append(text)
-                        elif update_type == "reasoning":
-                            latest_text[StreamLane.REASONING] = text
-                        else:
-                            latest_text[StreamLane.ANSWER] = text
-
-                    await _flush_latest()
-                except asyncio.TimeoutError:
-                    await _flush_latest()
-                except asyncio.CancelledError:
-                    await _flush_latest(force=True)
-                    for lane in [StreamLane.ANSWER, StreamLane.REASONING]:
-                        if stream_started[lane]:
+                    # Non-blocking queue drain: read all available items, keep latest per lane
+                    latest = {}  # lane -> text
+                    try:
+                        # Use run_in_executor to avoid blocking the event loop
+                        item = await loop.run_in_executor(
+                            None, lambda: streaming_queue.get(timeout=0.3)
+                        )
+                        update_type, text = item
+                        lane = StreamLane.REASONING if update_type == "reasoning" else StreamLane.ANSWER
+                        latest[lane] = text
+                        # Drain remaining items without blocking
+                        while True:
                             try:
-                                final_text = _compose_stream_answer(latest_text[lane], progress_lines) if lane == StreamLane.ANSWER else latest_text[lane].strip()
+                                update_type, text = streaming_queue.get_nowait()
+                                lane = StreamLane.REASONING if update_type == "reasoning" else StreamLane.ANSWER
+                                latest[lane] = text
+                            except queue.Empty:
+                                break
+                    except queue.Empty:
+                        continue
+
+                    # Throttle updates
+                    now = time.monotonic()
+                    if now - last_update_time < min_update_interval:
+                        await asyncio.sleep(min_update_interval - (now - last_update_time))
+
+                    for lane, text in latest.items():
+                        # Skip if text hasn't changed
+                        if text == last_sent[lane]:
+                            continue
+
+                        last_sent[lane] = text
+
+                        # Pass text directly — formatting is handled by the adapter
+                        display_text = text
+
+                        # Update or create the stream
+                        if stream_msg_id[lane] is None:
+                            result = await adapter.stream_start(
+                                chat_id=source.chat_id,
+                                initial_text=display_text,
+                                thread_id=source.thread_id,
+                                lane=lane,
+                            )
+                            if result.success and result.raw_response:
+                                stream_msg_id[lane] = result.raw_response.get("stream_key")
+                        else:
+                            await adapter.stream_update(
+                                chat_id=source.chat_id,
+                                text=display_text,
+                                lane=lane,
+                            )
+
+                    last_update_time = time.monotonic()
+
+                    # Restore typing indicator
+                    await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
+
+                except asyncio.CancelledError:
+                    # Finalize streams on cancel
+                    for lane in [StreamLane.ANSWER, StreamLane.REASONING]:
+                        if stream_msg_id[lane]:
+                            try:
                                 await adapter.stream_end(
                                     chat_id=source.chat_id,
-                                    final_text=final_text,
+                                    final_text=last_sent[lane],
                                     lane=lane,
                                 )
                             except Exception:
@@ -3105,6 +3099,10 @@ class GatewayRunner:
                 except Exception as e:
                     logger.debug("Streaming update error: %s", e)
                     await asyncio.sleep(0.5)
+        
+        # Background task to send progress messages
+        # Accumulates tool lines into a single message that gets edited
+        _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
 
         async def send_progress_messages():
             if not progress_queue:
@@ -3114,16 +3112,17 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            progress_lines = []
-            progress_msg_id = None
-            can_edit = True
+            progress_lines = []      # Accumulated tool lines
+            progress_msg_id = None   # ID of the progress message to edit
+            can_edit = True          # False once an edit fails (platform doesn't support it)
 
             while True:
                 try:
-                    msg = await asyncio.wait_for(progress_queue.get(), timeout=0.3)
+                    msg = progress_queue.get_nowait()
                     progress_lines.append(msg)
 
                     if can_edit and progress_msg_id is not None:
+                        # Try to edit the existing progress message
                         full_text = "\n".join(progress_lines)
                         result = await adapter.edit_message(
                             chat_id=source.chat_id,
@@ -3131,30 +3130,43 @@ class GatewayRunner:
                             content=full_text,
                         )
                         if not result.success:
+                            # Platform doesn't support editing — stop trying,
+                            # send just this new line as a separate message
                             can_edit = False
                             await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                     else:
-                        full_text = "\n".join(progress_lines) if can_edit else msg
-                        result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                        if can_edit:
+                            # First tool: send all accumulated text as new message
+                            full_text = "\n".join(progress_lines)
+                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                        else:
+                            # Editing unsupported: send just this line
+                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
+                    # Restore typing indicator
                     await asyncio.sleep(0.3)
                     await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
-                except asyncio.TimeoutError:
-                    continue
+
+                except queue.Empty:
+                    await asyncio.sleep(0.3)
                 except asyncio.CancelledError:
-                    while True:
+                    # Drain remaining queued messages
+                    while not progress_queue.empty():
                         try:
-                            progress_lines.append(progress_queue.get_nowait())
-                        except asyncio.QueueEmpty:
+                            msg = progress_queue.get_nowait()
+                            progress_lines.append(msg)
+                        except Exception:
                             break
+                    # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
+                        full_text = "\n".join(progress_lines)
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
                                 message_id=progress_msg_id,
-                                content="\n".join(progress_lines),
+                                content=full_text,
                             )
                         except Exception:
                             pass
@@ -3162,7 +3174,7 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
-
+        
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
