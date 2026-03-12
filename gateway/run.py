@@ -3491,7 +3491,7 @@ class GatewayRunner:
                 _chat = int(source.chat_id)
 
                 async def _deferred_delete():
-                    await asyncio.sleep(1.5)  # Let base.py send the final message
+                    await asyncio.sleep(1.0)  # Let base.py send the final message
                     for mid in _preview_msg_ids_to_delete:
                         try:
                             if _adapter and hasattr(_adapter, '_bot') and _adapter._bot:
