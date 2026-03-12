@@ -498,18 +498,20 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         Delete the streaming preview message.
 
-        Called after the final response is sent so the user only sees
-        the clean, fully-formatted message — matching OpenClaw's approach.
+        Uses discard_stream (no flush) so we don't send yet another copy
+        of the text.  The final formatted response is sent separately by
+        the normal base.py path.
         """
         if not self._streaming_manager:
             return SendResult(success=False, error="No active stream")
 
         try:
-            message_id = self._streaming_manager.get_stream_message_id(int(chat_id), lane)
-            await self._streaming_manager.stop_stream(int(chat_id), lane)
+            # Discard without flushing — returns the message_id to delete
+            message_id = await self._streaming_manager.discard_stream(int(chat_id), lane)
 
             if message_id and self._bot:
                 await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
+                logger.debug("[%s] Deleted stream preview %s", self.name, message_id)
                 return SendResult(success=True, message_id=str(message_id))
             return SendResult(success=True)
         except Exception as e:

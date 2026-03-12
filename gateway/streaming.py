@@ -284,6 +284,31 @@ class StreamingManager:
             except asyncio.CancelledError:
                 pass
 
+    async def discard_stream(
+        self,
+        chat_id: int,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> Optional[int]:
+        """Stop a stream WITHOUT flushing and return its message_id for deletion."""
+        key = self.get_stream_key(chat_id, lane)
+        stream = self._streams.pop(key, None)
+        task = self._tasks.pop(key, None)
+
+        message_id = stream.message_id if stream else None
+
+        if stream:
+            stream.stop()
+            # Do NOT flush — caller will delete the message
+
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        return message_id
+
     async def stop_all_streams(self, chat_id: int) -> None:
         for lane in StreamLane:
             await self.stop_stream(chat_id, lane)
