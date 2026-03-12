@@ -490,6 +490,32 @@ class TelegramAdapter(BasePlatformAdapter):
         
         return results
 
+    async def stream_delete(
+        self,
+        chat_id: str,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """
+        Delete the streaming preview message.
+
+        Called after the final response is sent so the user only sees
+        the clean, fully-formatted message — matching OpenClaw's approach.
+        """
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+
+        try:
+            message_id = self._streaming_manager.get_stream_message_id(int(chat_id), lane)
+            await self._streaming_manager.stop_stream(int(chat_id), lane)
+
+            if message_id and self._bot:
+                await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
+                return SendResult(success=True, message_id=str(message_id))
+            return SendResult(success=True)
+        except Exception as e:
+            logger.debug("[%s] Failed to delete stream preview: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     @property
     def streaming_enabled(self) -> bool:
         """Check if streaming is enabled for this adapter."""

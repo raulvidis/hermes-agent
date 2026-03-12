@@ -95,13 +95,11 @@ class TelegramDraftStream:
         text = text or ""
         # Escape first so truncation respects the expanded length
         escaped = html.escape(text, quote=False)
-        # Reserve room for <i></i> wrapper when reasoning
-        max_len = self.MAX_CHARS - (7 if self._lane == StreamLane.REASONING else 0)
+        # All streaming previews are italic (they're temporary and get deleted)
+        max_len = self.MAX_CHARS - 7  # Reserve room for <i></i>
         if len(escaped) > max_len:
             escaped = escaped[: max_len - 3] + "..."
-        if self._lane == StreamLane.REASONING:
-            return f"<i>{escaped}</i>"
-        return escaped
+        return f"<i>{escaped}</i>"
 
     async def _send_update(self, *, allow_stopped: bool = False) -> Optional[Dict[str, int]]:
         if self._stopped and not allow_stopped:

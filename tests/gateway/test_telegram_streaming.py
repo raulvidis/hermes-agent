@@ -35,4 +35,5 @@ def test_stop_stream_flushes_latest_pending_update():
     asyncio.run(_run())
 
     bot.send_message.assert_awaited_once()
-    assert bot.send_message.await_args.kwargs["text"] == "final pending update"
+    sent_text = bot.send_message.await_args.kwargs["text"]
+    assert sent_text == "<i>final pending update</i>"
