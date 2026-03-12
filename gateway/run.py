@@ -3484,28 +3484,16 @@ class GatewayRunner:
                     except asyncio.CancelledError:
                         pass
 
-            # Schedule deferred deletion of streaming preview messages.
-            # Must run AFTER the caller sends the final response, so we
-            # fire a background task with a short delay (OpenClaw pattern).
+            # Delete streaming preview messages after the final response is sent.
             if _preview_msg_ids_to_delete:
                 _adapter = self.adapters.get(source.platform)
                 if _adapter:
                     _chat = int(source.chat_id)
-
-                    async def _deferred_delete():
-                        await asyncio.sleep(0.3)
-                        for mid in _preview_msg_ids_to_delete:
-                            try:
-                                await _adapter.delete_message(chat_id=str(_chat), message_id=mid)
-                            except Exception as e:
-                                logger.debug("Preview delete failed (msg %s): %s", mid, e)
-
-                    def _log_task_error(t):
-                        if not t.cancelled() and (exc := t.exception()):
-                            logger.error("Deferred delete task failed: %s", exc)
-
-                    _task = asyncio.create_task(_deferred_delete())
-                    _task.add_done_callback(_log_task_error)
+                    for mid in _preview_msg_ids_to_delete:
+                        try:
+                            await _adapter.delete_message(chat_id=str(_chat), message_id=mid)
+                        except Exception as e:
+                            logger.debug("Preview delete failed (msg %s): %s", mid, e)
                 else:
                     logger.debug("No adapter for platform %s, skipping preview cleanup", source.platform)
 
