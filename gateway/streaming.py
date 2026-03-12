@@ -45,7 +45,7 @@ class TelegramDraftStream:
         chat_id: int,
         lane: StreamLane,
         thread_id: Optional[int] = None,
-        throttle_ms: int = 1000,
+        throttle_ms: int = 250,
         parse_mode: str = "HTML",
         initial_min_chars: int = 30,
     ):

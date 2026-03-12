@@ -197,7 +197,7 @@ class TelegramAdapter(BasePlatformAdapter):
             
             # Initialize streaming manager
             if self._streaming_enabled:
-                self._streaming_manager = StreamingManager(self, throttle_ms=1000)
+                self._streaming_manager = StreamingManager(self, throttle_ms=250)
                 logger.info("[%s] Streaming enabled for real-time message updates", self.name)
             
             return True
