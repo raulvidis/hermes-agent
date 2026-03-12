@@ -2143,6 +2143,83 @@ class AIAgent:
             logger.debug("Streaming failed, falling back to non-streaming: %s", e)
             return self.client.chat.completions.create(**api_kwargs)
 
+    def _run_streaming_chat_completion(self, api_kwargs: dict):
+        """Stream a chat completion, emitting text tokens via streaming_callback.
+
+        Returns a fake response object compatible with the non-streaming code path.
+        Falls back to non-streaming on any error.
+        """
+        from types import SimpleNamespace
+
+        stream_kwargs = dict(api_kwargs)
+        stream_kwargs["stream"] = True
+        stream_kwargs["stream_options"] = {"include_usage": True}
+
+        accumulated_content: list[str] = []
+        accumulated_tool_calls: dict[int, dict] = {}
+        final_usage = None
+
+        try:
+            stream = self.client.chat.completions.create(**stream_kwargs)
+
+            for chunk in stream:
+                if not chunk.choices:
+                    if chunk.usage:
+                        final_usage = chunk.usage
+                    continue
+
+                delta = chunk.choices[0].delta
+
+                if delta.content:
+                    accumulated_content.append(delta.content)
+                    self._emit_streaming_text("".join(accumulated_content))
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in accumulated_tool_calls:
+                            accumulated_tool_calls[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                accumulated_tool_calls[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                accumulated_tool_calls[idx]["arguments"] += tc_delta.function.arguments
+
+            tool_calls = []
+            for idx in sorted(accumulated_tool_calls):
+                tc = accumulated_tool_calls[idx]
+                if tc["name"]:
+                    tool_calls.append(
+                        SimpleNamespace(
+                            id=tc["id"],
+                            type="function",
+                            function=SimpleNamespace(name=tc["name"], arguments=tc["arguments"]),
+                        )
+                    )
+
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="".join(accumulated_content) or "",
+                            tool_calls=tool_calls or None,
+                            role="assistant",
+                        ),
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                    )
+                ],
+                usage=final_usage,
+                model=self.model,
+            )
+
+        except Exception as e:
+            logger.debug("Streaming failed, falling back to non-streaming: %s", e)
+            return self.client.chat.completions.create(**api_kwargs)
+
     def _run_codex_stream(self, api_kwargs: dict):
         """Execute one streaming Responses API request and return the final response."""
         max_stream_retries = 1
