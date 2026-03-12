@@ -3096,13 +3096,14 @@ class GatewayRunner:
                     for lane in [StreamLane.ANSWER, StreamLane.REASONING]:
                         if stream_started[lane]:
                             try:
-                                mid = await adapter._streaming_manager.discard_stream(
-                                    int(source.chat_id), lane,
+                                result = await adapter.stream_delete(
+                                    chat_id=source.chat_id, lane=lane,
+                                    deferred=True,
                                 )
-                                if mid:
-                                    _preview_msg_ids_to_delete.append(mid)
-                            except Exception:
-                                pass
+                                if result.success and result.message_id:
+                                    _preview_msg_ids_to_delete.append(int(result.message_id))
+                            except Exception as e:
+                                logger.debug("Stream discard error: %s", e)
                     return
                 except Exception as e:
                     logger.debug("Streaming update error: %s", e)
@@ -3496,10 +3497,11 @@ class GatewayRunner:
                         try:
                             if _adapter and hasattr(_adapter, '_bot') and _adapter._bot:
                                 await _adapter._bot.delete_message(chat_id=_chat, message_id=mid)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Deferred preview delete failed (msg %s): %s", mid, e)
 
-                asyncio.create_task(_deferred_delete())
+                _cleanup_task = asyncio.create_task(_deferred_delete())
+                _cleanup_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
 
         return response
 

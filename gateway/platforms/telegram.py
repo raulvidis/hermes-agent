@@ -494,26 +494,33 @@ class TelegramAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         lane: StreamLane = StreamLane.ANSWER,
+        *,
+        deferred: bool = False,
     ) -> SendResult:
         """
-        Delete the streaming preview message.
+        Discard the streaming preview and optionally delete the message.
 
-        Uses discard_stream (no flush) so we don't send yet another copy
-        of the text.  The final formatted response is sent separately by
-        the normal base.py path.
+        Args:
+            chat_id: Target chat ID.
+            lane: Stream lane to delete.
+            deferred: If True, only discard the stream and return the
+                message_id (caller is responsible for deleting later).
+                If False, delete the message immediately.
         """
         if not self._streaming_manager:
             return SendResult(success=False, error="No active stream")
 
         try:
-            # Discard without flushing — returns the message_id to delete
             message_id = await self._streaming_manager.discard_stream(int(chat_id), lane)
 
-            if message_id and self._bot:
+            if not deferred and message_id and self._bot:
                 await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
                 logger.debug("[%s] Deleted stream preview %s", self.name, message_id)
-                return SendResult(success=True, message_id=str(message_id))
-            return SendResult(success=True)
+
+            return SendResult(
+                success=True,
+                message_id=str(message_id) if message_id else None,
+            )
         except Exception as e:
             logger.debug("[%s] Failed to delete stream preview: %s", self.name, e)
             return SendResult(success=False, error=str(e))
