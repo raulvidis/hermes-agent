@@ -2,7 +2,8 @@
 Streaming infrastructure for real-time message updates.
 
 Implements a throttled draft stream loop similar to OpenClaw's approach:
-- Throttled updates (default 1000ms between edits)
+- Uses sendMessageDraft (unofficial Telegram API) in DMs for real-time
+  typing effect, falls back to sendMessage/editMessageText in groups
 - Coalesced pending updates so we keep the newest state
 - Support for both answer and reasoning lanes
 """
@@ -17,6 +18,15 @@ from threading import Lock
 from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+_DRAFT_ID_MAX = 2_147_483_647
+_next_draft_id = 0
+
+
+def _allocate_draft_id() -> int:
+    global _next_draft_id
+    _next_draft_id = _next_draft_id + 1 if _next_draft_id < _DRAFT_ID_MAX else 1
+    return _next_draft_id
 
 
 class StreamLane(Enum):
@@ -35,7 +45,12 @@ class StreamState:
 
 
 class TelegramDraftStream:
-    """Telegram-specific draft stream implementation."""
+    """Telegram-specific draft stream implementation.
+
+    Uses sendMessageDraft for DM chats (real-time typing effect) with
+    automatic fallback to sendMessage/editMessageText for groups or
+    when sendMessageDraft is unavailable.
+    """
 
     MAX_CHARS = 4096
 
@@ -48,6 +63,7 @@ class TelegramDraftStream:
         throttle_ms: int = 250,
         parse_mode: str = "HTML",
         initial_min_chars: int = 30,
+        use_draft_transport: bool = True,
     ):
         self._bot = bot
         self._chat_id = chat_id
@@ -62,6 +78,11 @@ class TelegramDraftStream:
         self._pending = ""
         self._stopped = False
 
+        # Draft transport state
+        self._use_draft = use_draft_transport
+        self._draft_id: Optional[int] = _allocate_draft_id() if use_draft_transport else None
+        self._draft_failed = False  # Fallback flag if sendMessageDraft is rejected
+
     @property
     def message_id(self) -> Optional[int]:
         return self._state.message_id
@@ -69,6 +90,10 @@ class TelegramDraftStream:
     @property
     def last_sent_text(self) -> str:
         return self._state.last_sent_text
+
+    @property
+    def using_draft_transport(self) -> bool:
+        return self._use_draft and not self._draft_failed
 
     def update(self, text: str) -> None:
         """Coalesce pending text to the most recent version."""
@@ -101,6 +126,42 @@ class TelegramDraftStream:
             escaped = escaped[: max_len - 3] + "..."
         return f"<i>{escaped}</i>"
 
+    async def _send_draft(self, formatted: str) -> bool:
+        """Try sendMessageDraft via do_api_request. Returns True on success."""
+        if not self._use_draft or self._draft_failed:
+            return False
+
+        try:
+            api_kwargs = {
+                "chat_id": self._chat_id,
+                "draft_id": self._draft_id,
+                "text": formatted,
+            }
+            if self._parse_mode:
+                api_kwargs["parse_mode"] = self._parse_mode
+            if self._thread_id is not None:
+                api_kwargs["message_thread_id"] = self._thread_id
+
+            await self._bot.do_api_request(
+                "sendMessageDraft",
+                api_kwargs=api_kwargs,
+            )
+            return True
+        except Exception as e:
+            err_msg = str(e).lower()
+            # Permanent failures — fall back to message transport
+            if any(kw in err_msg for kw in (
+                "unknown method", "not found", "not available",
+                "not supported", "unsupported", "can't be used",
+                "can be used only",
+            )):
+                logger.info("sendMessageDraft unavailable, falling back to editMessageText: %s", e)
+                self._draft_failed = True
+                return False
+            # Transient error — still try fallback this time
+            logger.debug("sendMessageDraft error (will retry): %s", e)
+            return False
+
     async def _send_update(self, *, allow_stopped: bool = False) -> Optional[Dict[str, int]]:
         if self._stopped and not allow_stopped:
             return None
@@ -123,6 +184,14 @@ class TelegramDraftStream:
 
         formatted = self._format_text(text)
 
+        # Try draft transport first (typing bubble effect in DMs)
+        if self.using_draft_transport:
+            if await self._send_draft(formatted):
+                self._state.last_sent_text = text
+                self._state.last_sent_time = time.time()
+                return None  # No message_id for drafts
+
+        # Fallback: sendMessage / editMessageText
         try:
             if self._state.message_id is not None and not force_new:
                 result = await self._bot.edit_message_text(
@@ -207,7 +276,7 @@ class ReasoningLaneCoordinator:
 class StreamingManager:
     """Manages multiple concurrent streams per chat."""
 
-    def __init__(self, adapter, throttle_ms: int = 1000):
+    def __init__(self, adapter, throttle_ms: int = 250):
         self._adapter = adapter
         self._throttle_ms = throttle_ms
         self._streams: Dict[str, TelegramDraftStream] = {}

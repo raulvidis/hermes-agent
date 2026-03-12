@@ -9,7 +9,9 @@ def test_reasoning_stream_formats_with_real_html_italics():
     bot = AsyncMock()
     bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=101))
 
-    stream = TelegramDraftStream(bot=bot, chat_id=123, lane=StreamLane.REASONING)
+    stream = TelegramDraftStream(
+        bot=bot, chat_id=123, lane=StreamLane.REASONING, use_draft_transport=False,
+    )
     stream.update("think <fast> & clearly" * 3)
     asyncio.run(stream.flush())
 
@@ -29,6 +31,9 @@ def test_stop_stream_flushes_latest_pending_update():
 
     async def _run():
         await manager.start_stream(chat_id=77, lane=StreamLane.ANSWER)
+        # Disable draft transport on the stream so it uses sendMessage
+        key = manager.get_stream_key(77, StreamLane.ANSWER)
+        manager._streams[key]._use_draft = False
         await manager.update_stream(chat_id=77, text="final pending update", lane=StreamLane.ANSWER)
         await manager.stop_stream(chat_id=77, lane=StreamLane.ANSWER)
 
@@ -48,6 +53,8 @@ def test_discard_stream_returns_message_id_without_flushing():
 
     async def _run():
         await manager.start_stream(chat_id=88, lane=StreamLane.ANSWER)
+        key = manager.get_stream_key(88, StreamLane.ANSWER)
+        manager._streams[key]._use_draft = False
         await manager.update_stream(chat_id=88, text="a]" * 20, lane=StreamLane.ANSWER)
         # Let the background loop send the first message
         await asyncio.sleep(0.05)
@@ -65,3 +72,48 @@ def test_discard_stream_returns_message_id_without_flushing():
     for call in getattr(bot, 'edit_message_text', AsyncMock()).await_args_list:
         text = call.kwargs.get("text", "")
         assert "should not be sent" not in text
+
+
+def test_draft_transport_calls_do_api_request():
+    """Draft transport should call do_api_request with sendMessageDraft."""
+    bot = AsyncMock()
+    bot.do_api_request = AsyncMock(return_value=True)
+
+    stream = TelegramDraftStream(
+        bot=bot, chat_id=123, lane=StreamLane.ANSWER, use_draft_transport=True,
+    )
+    stream.update("hello world — streaming draft test")
+    asyncio.run(stream.flush())
+
+    bot.do_api_request.assert_awaited_once()
+    call_args = bot.do_api_request.await_args
+    assert call_args.args[0] == "sendMessageDraft"
+    api_kwargs = call_args.kwargs.get("api_kwargs") or call_args.args[1]
+    assert api_kwargs["chat_id"] == 123
+    assert api_kwargs["text"].startswith("<i>")
+    assert "draft_id" in api_kwargs
+    # send_message should NOT have been called
+    bot.send_message.assert_not_awaited()
+
+
+def test_draft_transport_falls_back_on_unsupported():
+    """When sendMessageDraft fails with 'unknown method', fall back to sendMessage."""
+    bot = AsyncMock()
+    bot.do_api_request = AsyncMock(
+        side_effect=Exception("400: unknown method sendMessageDraft"),
+    )
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=501))
+
+    stream = TelegramDraftStream(
+        bot=bot, chat_id=456, lane=StreamLane.ANSWER, use_draft_transport=True,
+    )
+    stream.update("fallback test with enough characters")
+    asyncio.run(stream.flush())
+
+    # Draft was attempted
+    bot.do_api_request.assert_awaited_once()
+    # Fell back to sendMessage
+    bot.send_message.assert_awaited_once()
+    assert stream.message_id == 501
+    # Draft transport should now be disabled
+    assert not stream.using_draft_transport
