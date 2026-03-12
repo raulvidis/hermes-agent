@@ -16,11 +16,12 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message
+    from telegram import Update, Bot, Message, InlineKeyboardMarkup, InlineKeyboardButton
     from telegram.ext import (
         Application,
         CommandHandler,
         MessageHandler as TelegramMessageHandler,
+        CallbackQueryHandler,
         ContextTypes,
         filters,
     )
@@ -34,6 +35,9 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     TelegramMessageHandler = Any
+    CallbackQueryHandler = Any
+    InlineKeyboardMarkup = Any
+    InlineKeyboardButton = Any
     filters = None
     ParseMode = None
     ChatType = None
@@ -58,6 +62,20 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
+)
+from gateway.keyboards import (
+    InlineButton,
+    CallbackType,
+    parse_callback_data,
+    build_inline_keyboard,
+    build_provider_keyboard,
+    build_models_keyboard,
+    build_exec_approval_buttons,
+    build_browse_providers_button,
+    clear_inline_keyboard,
+    ParsedModelCallback,
+    ParsedApprovalCallback,
+    ProviderInfo,
 )
 
 
@@ -147,6 +165,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
+            
+            # Register callback query handler for inline keyboard buttons
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             
             # Start polling in background
             await self._app.initialize()
