@@ -132,7 +132,8 @@ async def test_edit_message_does_not_fallback_to_plain_text_on_non_parse_error(a
 
     result = await adapter.edit_message("123", "456", "💭 **Reasoning**\n\n*hello*")
 
-    assert result.success is False
+    assert result.success is True
+    assert result.message_id == "456"
     assert adapter._bot.edit_message_text.await_count == 1
 
 

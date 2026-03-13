@@ -300,7 +300,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     parse_mode=ParseMode.MARKDOWN_V2,
                 )
             except Exception as md_error:
-                if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                err_text = str(md_error).lower()
+                if "not modified" in err_text:
+                    return SendResult(success=True, message_id=message_id)
+                if "parse" in err_text or "markdown" in err_text:
                     plain_text = _strip_mdv2(formatted)
                     await self._bot.edit_message_text(
                         chat_id=int(chat_id),
