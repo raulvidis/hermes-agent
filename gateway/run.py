@@ -3060,7 +3060,7 @@ class GatewayRunner:
                     streaming_on = adapter.streaming_enabled_for(int(source.chat_id))
                 else:
                     streaming_on = getattr(adapter, 'streaming_enabled', False)
-            logger.debug("send_streaming_updates: streaming_on=%s for chat %s", streaming_on, source.chat_id)
+            logger.info("send_streaming_updates: streaming_on=%s for chat %s", streaming_on, source.chat_id)
             if not streaming_on:
                 return
 

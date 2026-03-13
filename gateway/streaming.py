@@ -149,7 +149,7 @@ class TelegramDraftStream:
                 "not supported", "unsupported", "can't be used",
                 "can be used only",
             )):
-                logger.info("sendMessageDraft unavailable, falling back to editMessageText: %s", e)
+                logger.warning("sendMessageDraft unavailable, falling back to editMessageText: %s", e)
                 self._draft_failed = True
                 return False
             # Transient error — still try fallback this time
@@ -175,7 +175,7 @@ class TelegramDraftStream:
             return None
 
         formatted = self._format_text(text)
-        logger.debug("stream _send_update: len=%d msg_id=%s draft=%s", len(text), self._state.message_id, self.using_draft_transport)
+        logger.info("stream _send_update: len=%d msg_id=%s draft=%s", len(text), self._state.message_id, self.using_draft_transport)
 
         # Try draft transport first (typing bubble effect in DMs)
         if self.using_draft_transport:
