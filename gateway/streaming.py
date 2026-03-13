@@ -62,7 +62,7 @@ class TelegramDraftStream:
         throttle_ms: int = 250,
         parse_mode: str = "HTML",
         initial_min_chars: int = 30,
-        use_draft_transport: bool = True,
+        use_draft_transport: bool = False,
     ):
         self._bot = bot
         self._chat_id = chat_id
@@ -175,7 +175,7 @@ class TelegramDraftStream:
             return None
 
         formatted = self._format_text(text)
-        logger.info("stream _send_update: len=%d msg_id=%s draft=%s", len(text), self._state.message_id, self.using_draft_transport)
+        logger.debug("stream _send_update: len=%d msg_id=%s draft=%s", len(text), self._state.message_id, self.using_draft_transport)
 
         # Try draft transport first (typing bubble effect in DMs)
         if self.using_draft_transport:

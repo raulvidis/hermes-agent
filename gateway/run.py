@@ -3060,38 +3060,44 @@ class GatewayRunner:
                     streaming_on = adapter.streaming_enabled_for(int(source.chat_id))
                 else:
                     streaming_on = getattr(adapter, 'streaming_enabled', False)
-            logger.info("send_streaming_updates: streaming_on=%s for chat %s", streaming_on, source.chat_id)
+            logger.debug("send_streaming_updates: streaming_on=%s for chat %s", streaming_on, source.chat_id)
             if not streaming_on:
                 return
 
-            stream_started = {StreamLane.ANSWER: False, StreamLane.REASONING: False}
+            stream_started = False
             latest_text = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}
             progress_lines: list[str] = []
 
             async def _flush_latest():
-                answer_payload = _compose_stream_answer(latest_text[StreamLane.ANSWER], progress_lines)
-                pending_payloads = {
-                    StreamLane.ANSWER: answer_payload,
-                    StreamLane.REASONING: latest_text[StreamLane.REASONING].strip(),
-                }
+                nonlocal stream_started
+                # Compose a single preview: reasoning → progress → answer
+                reasoning = latest_text[StreamLane.REASONING].strip()
+                answer = _compose_stream_answer(latest_text[StreamLane.ANSWER], progress_lines)
 
-                for lane, payload in pending_payloads.items():
-                    if not payload:
-                        continue
-                    if not stream_started[lane]:
-                        result = await adapter.stream_start(
-                            chat_id=source.chat_id,
-                            initial_text=payload,
-                            thread_id=source.thread_id,
-                            lane=lane,
-                        )
-                        stream_started[lane] = bool(result.success)
-                    else:
-                        await adapter.stream_update(
-                            chat_id=source.chat_id,
-                            text=payload,
-                            lane=lane,
-                        )
+                parts = []
+                if reasoning:
+                    parts.append(f"💭 {reasoning}")
+                if answer:
+                    parts.append(answer)
+                payload = "\n\n".join(parts)
+                if not payload:
+                    return
+
+                lane = StreamLane.ANSWER
+                if not stream_started:
+                    result = await adapter.stream_start(
+                        chat_id=source.chat_id,
+                        initial_text=payload,
+                        thread_id=source.thread_id,
+                        lane=lane,
+                    )
+                    stream_started = bool(result.success)
+                else:
+                    await adapter.stream_update(
+                        chat_id=source.chat_id,
+                        text=payload,
+                        lane=lane,
+                    )
 
                 await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
 
@@ -3122,20 +3128,19 @@ class GatewayRunner:
                 except asyncio.TimeoutError:
                     await _flush_latest()
                 except asyncio.CancelledError:
-                    # Discard streams without flushing or deleting yet.
+                    # Discard stream without flushing or deleting yet.
                     # Stash message IDs so they can be deleted AFTER the
                     # final response is sent (avoids visual flash).
-                    for lane in [StreamLane.ANSWER, StreamLane.REASONING]:
-                        if stream_started[lane]:
-                            try:
-                                result = await adapter.stream_delete(
-                                    chat_id=source.chat_id, lane=lane,
-                                    deferred=True,
-                                )
-                                if result.success and result.message_id:
-                                    _preview_msg_ids_to_delete.append(int(result.message_id))
-                            except Exception as e:
-                                logger.debug("Stream discard error: %s", e)
+                    if stream_started:
+                        try:
+                            result = await adapter.stream_delete(
+                                chat_id=source.chat_id, lane=StreamLane.ANSWER,
+                                deferred=True,
+                            )
+                            if result.success and result.message_id:
+                                _preview_msg_ids_to_delete.append(int(result.message_id))
+                        except Exception as e:
+                            logger.debug("Stream discard error: %s", e)
                     return
                 except Exception as e:
                     logger.debug("Streaming update error: %s", e)
