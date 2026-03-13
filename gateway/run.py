@@ -3044,6 +3044,7 @@ class GatewayRunner:
 
         def streaming_callback(text: str, is_reasoning: bool = False):
             """Callback invoked by agent when streaming text is available."""
+            print(f"[STREAM-DBG] streaming_callback fired: is_reasoning={is_reasoning} len={len(text or '')}")
             _queue_put_threadsafe(streaming_queue, ("reasoning" if is_reasoning else "text", text or ""))
 
         def reasoning_stream_callback(text: str):
