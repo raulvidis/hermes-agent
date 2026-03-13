@@ -1,5 +1,6 @@
 """Tests for gateway /reasoning command behavior."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -107,3 +108,82 @@ async def test_delete_preview_message_deletes_transient_reasoning_bubble():
     await runner._delete_preview_message(adapter, source, "789")
 
     adapter.delete_message.assert_awaited_once_with(chat_id="456", message_id="789")
+
+
+@pytest.mark.asyncio
+async def test_reasoning_preview_does_not_send_duplicate_after_edit_failure():
+    runner, _, _ = _make_runner()
+    sent_payloads = []
+    state = {"sent_once": False}
+
+    async def _send(chat_id, content, metadata=None):
+        sent_payloads.append(content)
+        state["sent_once"] = True
+        return SimpleNamespace(success=True, message_id="preview-1")
+
+    async def _edit_message(chat_id, message_id, content):
+        if state["sent_once"]:
+            return SimpleNamespace(success=False, error="message is not modified")
+        return SimpleNamespace(success=True, message_id=message_id)
+
+    adapter = SimpleNamespace(
+        send=AsyncMock(side_effect=_send),
+        edit_message=AsyncMock(side_effect=_edit_message),
+        send_typing=AsyncMock(return_value=None),
+        delete_message=AsyncMock(return_value=True),
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="123",
+        chat_id="456",
+        user_name="tester",
+    )
+    reasoning_queue = asyncio.Queue()
+    await reasoning_queue.put("first thought")
+    await reasoning_queue.put("second thought")
+
+    async def _reasoning_worker():
+        latest_text = ""
+        reasoning_msg_id = None
+        can_edit = True
+        try:
+            while True:
+                latest_text = await asyncio.wait_for(reasoning_queue.get(), timeout=0.01)
+                while True:
+                    try:
+                        latest_text = reasoning_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                payload = runner._format_reasoning_preview(latest_text)
+                if can_edit and reasoning_msg_id is not None:
+                    result = await adapter.edit_message(
+                        chat_id=source.chat_id,
+                        message_id=reasoning_msg_id,
+                        content=payload,
+                    )
+                    if not result.success:
+                        can_edit = False
+
+                if reasoning_msg_id is None:
+                    result = await adapter.send(
+                        chat_id=source.chat_id,
+                        content=payload,
+                        metadata=None,
+                    )
+                    if result.success and result.message_id:
+                        reasoning_msg_id = result.message_id
+
+                await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            await runner._delete_preview_message(adapter, source, reasoning_msg_id)
+            raise
+
+    task = asyncio.create_task(_reasoning_worker())
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert adapter.send.await_count == 1
+    adapter.delete_message.assert_awaited_once_with(chat_id="456", message_id="preview-1")

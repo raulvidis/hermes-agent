@@ -2857,7 +2857,6 @@ class GatewayRunner:
                         )
                         if not result.success:
                             can_edit = False
-                            reasoning_msg_id = None
 
                     if reasoning_msg_id is None:
                         result = await adapter.send(
