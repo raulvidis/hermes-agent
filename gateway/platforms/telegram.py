@@ -117,6 +117,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._streaming_enabled: bool = getattr(config, 'streaming_enabled', False)
         # Per-chat streaming mode: "off", "on" (tool logs), "detailed" (logs + answer/reasoning)
         self._streaming_chat_modes: dict[int, str] = {}
+        # Per-chat reasoning visibility: "off", "on", "stream"
+        self._reasoning_chat_modes: dict[int, str] = {}
 
     @property
     def bot(self) -> Optional[Bot]:
@@ -186,6 +188,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommand("insights", "Show usage insights and analytics"),
                     BotCommand("update", "Update Hermes to the latest version"),
                     BotCommand("reload_mcp", "Reload MCP servers from config"),
+                    BotCommand("reasoning", "Toggle reasoning visibility"),
                     BotCommand("streaming", "Toggle real-time streaming"),
                     BotCommand("help", "Show available commands"),
                 ])
@@ -522,6 +525,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if self._streaming_enabled:
             return True
+        if self.reasoning_mode_for(chat_id) == "stream":
+            return True
         return self._streaming_chat_modes.get(chat_id, "off") != "off"
 
     def streaming_mode_for(self, chat_id: int) -> str:
@@ -552,6 +557,18 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             self._streaming_chat_modes[chat_id] = "on"
             return True
+
+    def reasoning_mode_for(self, chat_id: int) -> str:
+        """Return reasoning mode for a chat: 'off', 'on', or 'stream'."""
+        return self._reasoning_chat_modes.get(chat_id, "off")
+
+    def set_reasoning_mode(self, chat_id: int, mode: str) -> str:
+        """Set reasoning mode for a chat. Returns the mode that was set."""
+        if mode == "off":
+            self._reasoning_chat_modes.pop(chat_id, None)
+        else:
+            self._reasoning_chat_modes[chat_id] = mode
+        return mode
 
     async def send_voice(
         self,
@@ -948,6 +965,16 @@ class TelegramAdapter(BasePlatformAdapter):
             self.set_streaming_mode(chat_id, mode)
             labels = {"off": "⏹ Streaming disabled.", "on": "✅ Streaming: on — tool logs.", "detailed": "✅ Streaming: detailed — tool logs + live answer."}
             await query.edit_message_text(labels.get(mode, f"Streaming set to {mode}."))
+        elif query.data.startswith("reasoning:"):
+            mode = query.data.split(":", 1)[1]
+            chat_id = query.message.chat_id
+            self.set_reasoning_mode(chat_id, mode)
+            labels = {
+                "off": "⏹ Reasoning hidden.",
+                "on": "✅ Reasoning visible after completion.",
+                "stream": "✅ Reasoning: stream — live reasoning only.",
+            }
+            await query.edit_message_text(labels.get(mode, f"Reasoning set to {mode}."))
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""

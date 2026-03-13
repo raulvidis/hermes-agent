@@ -847,7 +847,7 @@ class GatewayRunner:
                           "personality", "retry", "undo", "sethome", "set-home",
                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
                           "update", "title", "resume", "provider", "rollback",
-                          "background", "streaming"}
+                          "background", "streaming", "reasoning"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -915,6 +915,9 @@ class GatewayRunner:
 
         if command == "streaming":
             return await self._handle_streaming_command(event)
+
+        if command == "reasoning":
+            return await self._handle_reasoning_command(event)
         
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -1356,6 +1359,8 @@ class GatewayRunner:
             
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
+            last_reasoning = (agent_result.get("last_reasoning", "") or "").strip()
+            reasoning_mode = getattr(session_entry, "reasoning_mode", "off")
 
             # Stash streaming preview IDs on the adapter so they get deleted
             # after the final response message is sent (see base.py post-send hook).
@@ -1370,6 +1375,16 @@ class GatewayRunner:
                 **hook_ctx,
                 "response": (response or "")[:500],
             })
+
+            if reasoning_mode == "on" and last_reasoning:
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    _reasoning_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    await _adapter.send(
+                        source.chat_id,
+                        f"💭 **Reasoning**\n\n{last_reasoning}",
+                        metadata=_reasoning_meta,
+                    )
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -1521,6 +1536,7 @@ class GatewayRunner:
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ]
         
+        lines.insert(-1, f"**Reasoning:** {getattr(session_entry, 'reasoning_mode', 'off')}")
         return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
@@ -1562,6 +1578,8 @@ class GatewayRunner:
             "`/update` — Update Hermes Agent to the latest version",
             "`/help` — Show this message",
         ]
+        lines.insert(16, "`/reasoning [off|on|stream]` â€” Control reasoning visibility")
+        lines[16] = "`/reasoning [off|on|stream]` - Control reasoning visibility"
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
@@ -2026,6 +2044,35 @@ class GatewayRunner:
                 return "✅ Streaming enabled — you'll see real-time typing previews."
             else:
                 return "⏹ Streaming disabled — responses will appear as complete messages."
+
+    async def _handle_reasoning_command(self, event: MessageEvent) -> str:
+        """Handle /reasoning - control reasoning visibility for this session."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        adapter = self.adapters.get(source.platform)
+        arg = event.get_command_args().strip().lower()
+        valid_modes = {"off", "on", "stream"}
+
+        if not arg:
+            return (
+                f"Current reasoning mode: `{getattr(session_entry, 'reasoning_mode', 'off')}`.\n"
+                "Usage: `/reasoning off`, `/reasoning on`, or `/reasoning stream`."
+            )
+
+        if arg not in valid_modes:
+            return "Unrecognized reasoning mode. Valid options: `off`, `on`, `stream`."
+
+        self.session_store.set_reasoning_mode(session_key, arg)
+        if adapter and hasattr(adapter, "set_reasoning_mode"):
+            adapter.set_reasoning_mode(int(source.chat_id), arg)
+
+        labels = {
+            "off": "Reasoning hidden for this chat.",
+            "on": "Reasoning will be shown after the reply completes.",
+            "stream": "Reasoning will stream live for this chat.",
+        }
+        return labels[arg]
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
@@ -3077,9 +3124,14 @@ class GatewayRunner:
 
         def streaming_callback(text: str, is_reasoning: bool = False):
             """Callback invoked by agent when streaming text is available."""
+            if is_reasoning:
+                if _reasoning_mode != "stream":
+                    return
+                _queue_put_threadsafe(streaming_queue, ("reasoning", text or ""))
+                return
             if _streaming_mode != "detailed":
-                return  # "on" mode only shows tool logs, not answer/reasoning
-            _queue_put_threadsafe(streaming_queue, ("reasoning" if is_reasoning else "text", text or ""))
+                return  # "on" mode only shows tool logs, not answer text
+            _queue_put_threadsafe(streaming_queue, ("text", text or ""))
 
         def reasoning_stream_callback(text: str):
             streaming_callback(text, is_reasoning=True)
@@ -3087,6 +3139,10 @@ class GatewayRunner:
         _stream_metadata = {"thread_id": source.thread_id} if source.thread_id else None
         _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
         _preview_msg_ids_to_delete: list[int] = []  # Filled on cancel, deleted after final send
+        _reasoning_mode = getattr(self.session_store.get_or_create_session(source), "reasoning_mode", "off")
+        _adapter_for_reasoning = self.adapters.get(source.platform)
+        if _adapter_for_reasoning and hasattr(_adapter_for_reasoning, "set_reasoning_mode"):
+            _adapter_for_reasoning.set_reasoning_mode(int(source.chat_id), _reasoning_mode)
 
         def _compose_stream_answer(answer_text: str, progress_lines: list[str]) -> str:
             answer_text = (answer_text or "").strip()
@@ -3117,9 +3173,16 @@ class GatewayRunner:
 
             async def _flush_latest():
                 nonlocal stream_started
-                # Compose a single preview: reasoning → progress → answer
-                reasoning = latest_text[StreamLane.REASONING].strip()
-                answer = _compose_stream_answer(latest_text[StreamLane.ANSWER], progress_lines)
+                show_reasoning = _reasoning_mode == "stream"
+                show_answer = _streaming_mode == "detailed"
+                show_progress = _streaming_mode in ("on", "detailed")
+                reasoning = latest_text[StreamLane.REASONING].strip() if show_reasoning else ""
+                answer = ""
+                if show_answer or show_progress:
+                    answer = _compose_stream_answer(
+                        latest_text[StreamLane.ANSWER] if show_answer else "",
+                        progress_lines if show_progress else [],
+                    )
 
                 parts = []
                 if reasoning:
@@ -3428,6 +3491,7 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            last_reasoning = result.get("last_reasoning")
 
             # Extract last actual prompt token count from the agent's compressor
             _last_prompt_toks = 0
@@ -3439,6 +3503,7 @@ class GatewayRunner:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
                 return {
                     "final_response": error_msg,
+                    "last_reasoning": last_reasoning,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
@@ -3483,6 +3548,7 @@ class GatewayRunner:
             
             return {
                 "final_response": final_response,
+                "last_reasoning": last_reasoning,
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
