@@ -1993,17 +1993,39 @@ class GatewayRunner:
         return f"❌ {result['error']}"
 
     async def _handle_streaming_command(self, event: MessageEvent) -> str:
-        """Handle /streaming — toggle real-time streaming for this chat."""
+        """Handle /streaming — show mode picker (off / on / detailed)."""
         source = event.source
         adapter = self.adapters.get(source.platform)
-        if not adapter or not hasattr(adapter, 'toggle_streaming'):
+        if not adapter or not hasattr(adapter, 'set_streaming_mode'):
             return "Streaming is not available on this platform."
-        chat_id = int(source.chat_id)
-        enabled = adapter.toggle_streaming(chat_id)
-        if enabled:
-            return "✅ Streaming enabled — you'll see real-time typing previews."
-        else:
-            return "⏹ Streaming disabled — responses will appear as complete messages."
+
+        # Send inline keyboard for mode selection
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            chat_id = int(source.chat_id)
+            current = adapter.streaming_mode_for(chat_id) if hasattr(adapter, 'streaming_mode_for') else "off"
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("off", callback_data="streaming:off"),
+                    InlineKeyboardButton("on", callback_data="streaming:on"),
+                    InlineKeyboardButton("detailed", callback_data="streaming:detailed"),
+                ]
+            ])
+            await adapter._bot.send_message(
+                chat_id=chat_id,
+                text=f"Choose streaming mode (current: <b>{current}</b>):",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return ""  # Empty — we already sent the picker
+        except Exception:
+            # Fallback to simple toggle if inline keyboard fails
+            chat_id = int(source.chat_id)
+            enabled = adapter.toggle_streaming(chat_id)
+            if enabled:
+                return "✅ Streaming enabled — you'll see real-time typing previews."
+            else:
+                return "⏹ Streaming disabled — responses will appear as complete messages."
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
@@ -2943,11 +2965,20 @@ class GatewayRunner:
         # only when streaming is actually enabled for this chat.
         _tg_adapter = self.adapters.get(source.platform)
         telegram_stream_progress = False
-        if _tg_adapter and hasattr(_tg_adapter, 'streaming_enabled_for'):
-            try:
-                telegram_stream_progress = _tg_adapter.streaming_enabled_for(int(source.chat_id))
-            except (ValueError, TypeError):
-                pass
+        _streaming_mode = "off"  # "off", "on" (tool logs only), "detailed" (logs + answer)
+        if _tg_adapter:
+            if hasattr(_tg_adapter, 'streaming_mode_for'):
+                try:
+                    _streaming_mode = _tg_adapter.streaming_mode_for(int(source.chat_id))
+                except (ValueError, TypeError):
+                    pass
+            elif hasattr(_tg_adapter, 'streaming_enabled_for'):
+                try:
+                    if _tg_adapter.streaming_enabled_for(int(source.chat_id)):
+                        _streaming_mode = "detailed"
+                except (ValueError, TypeError):
+                    pass
+        telegram_stream_progress = _streaming_mode != "off"
 
         progress_queue: Optional[asyncio.Queue[str]] = asyncio.Queue() if tool_progress_enabled else None
         streaming_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
@@ -3044,6 +3075,8 @@ class GatewayRunner:
 
         def streaming_callback(text: str, is_reasoning: bool = False):
             """Callback invoked by agent when streaming text is available."""
+            if _streaming_mode != "detailed":
+                return  # "on" mode only shows tool logs, not answer/reasoning
             print(f"[STREAM-DBG] streaming_callback fired: is_reasoning={is_reasoning} len={len(text or '')}")
             _queue_put_threadsafe(streaming_queue, ("reasoning" if is_reasoning else "text", text or ""))
 

@@ -16,11 +16,12 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
         Application,
         CommandHandler,
         MessageHandler as TelegramMessageHandler,
+        CallbackQueryHandler,
         ContextTypes,
         filters,
     )
@@ -114,7 +115,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._streaming_manager: Optional[StreamingManager] = None
         self._streaming_enabled: bool = getattr(config, 'streaming_enabled', False)
-        self._streaming_chats: set[int] = set()  # Per-chat streaming toggle
+        # Per-chat streaming mode: "off", "on" (tool logs), "detailed" (logs + answer/reasoning)
+        self._streaming_chat_modes: dict[int, str] = {}
 
     @property
     def bot(self) -> Optional[Bot]:
@@ -156,7 +158,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
-            
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
             # Start polling in background
             await self._app.initialize()
             await self._app.start()
@@ -510,25 +513,40 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
 
     def streaming_enabled_for(self, chat_id: int) -> bool:
-        """Check if streaming is enabled for a specific chat."""
+        """Check if streaming is enabled for a specific chat (any mode)."""
         if not self._streaming_manager:
             return False
         if self._streaming_enabled:
             return True
-        return chat_id in self._streaming_chats
+        return self._streaming_chat_modes.get(chat_id, "off") != "off"
+
+    def streaming_mode_for(self, chat_id: int) -> str:
+        """Return streaming mode for a chat: 'off', 'on', or 'detailed'."""
+        if self._streaming_enabled:
+            return "detailed"
+        return self._streaming_chat_modes.get(chat_id, "off")
 
     @property
     def streaming_enabled(self) -> bool:
         """Check if streaming is enabled globally."""
         return self._streaming_enabled and self._streaming_manager is not None
 
+    def set_streaming_mode(self, chat_id: int, mode: str) -> str:
+        """Set streaming mode for a chat. Returns the mode that was set."""
+        if mode == "off":
+            self._streaming_chat_modes.pop(chat_id, None)
+        else:
+            self._streaming_chat_modes[chat_id] = mode
+        return mode
+
     def toggle_streaming(self, chat_id: int) -> bool:
-        """Toggle streaming for a chat. Returns new state."""
-        if chat_id in self._streaming_chats:
-            self._streaming_chats.discard(chat_id)
+        """Toggle streaming for a chat. Returns new state. (Legacy compat)"""
+        current = self._streaming_chat_modes.get(chat_id, "off")
+        if current != "off":
+            self._streaming_chat_modes.pop(chat_id, None)
             return False
         else:
-            self._streaming_chats.add(chat_id)
+            self._streaming_chat_modes[chat_id] = "on"
             return True
 
     async def send_voice(
@@ -913,6 +931,20 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
     
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+
+        if query.data.startswith("streaming:"):
+            mode = query.data.split(":", 1)[1]
+            chat_id = query.message.chat_id
+            self.set_streaming_mode(chat_id, mode)
+            labels = {"off": "⏹ Streaming disabled.", "on": "✅ Streaming: on — tool logs.", "detailed": "✅ Streaming: detailed — tool logs + live answer."}
+            await query.edit_message_text(labels.get(mode, f"Streaming set to {mode}."))
+
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:
