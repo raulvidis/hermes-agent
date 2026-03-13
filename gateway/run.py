@@ -2055,6 +2055,27 @@ class GatewayRunner:
         valid_modes = {"off", "on", "stream"}
 
         if not arg:
+            if source.platform == Platform.TELEGRAM and adapter and hasattr(adapter, "_bot"):
+                try:
+                    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                    chat_id = int(source.chat_id)
+                    current = getattr(session_entry, "reasoning_mode", "off")
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("off", callback_data="reasoning:off"),
+                            InlineKeyboardButton("on", callback_data="reasoning:on"),
+                            InlineKeyboardButton("stream", callback_data="reasoning:stream"),
+                        ]
+                    ])
+                    await adapter._bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Choose reasoning mode (current: <b>{current}</b>):",
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                    return ""
+                except Exception:
+                    pass
             return (
                 f"Current reasoning mode: `{getattr(session_entry, 'reasoning_mode', 'off')}`.\n"
                 "Usage: `/reasoning off`, `/reasoning on`, or `/reasoning stream`."

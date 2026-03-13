@@ -672,7 +672,15 @@ class AIAgent:
         self.session_completion_tokens = 0
         self.session_total_tokens = 0
         self.session_api_calls = 0
-        
+
+        # AgentScore tracking (opt-in via env vars)
+        self._agentscore_tracker = None
+        try:
+            from agentscore import create_tracker_from_env
+            self._agentscore_tracker = create_tracker_from_env()
+        except Exception:
+            pass
+
         if not self.quiet_mode:
             if compression_enabled:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (compress at {int(compression_threshold*100)}% = {self.context_compressor.threshold_tokens:,})")
@@ -836,6 +844,19 @@ class AIAgent:
             return "\n\n".join(reasoning_parts)
         
         return None
+
+    def _merge_stream_reasoning(self, current: str, delta_obj: Any) -> str:
+        """Merge streaming reasoning content from chat-completion deltas."""
+        chunk = self._extract_reasoning(delta_obj)
+        if not chunk:
+            return current
+        if not current:
+            return chunk
+        if chunk.startswith(current):
+            return chunk
+        if current.endswith(chunk):
+            return current
+        return current + chunk
     
     def _cleanup_task_resources(self, task_id: str) -> None:
         """Clean up VM and browser resources for a given task."""
@@ -2071,6 +2092,7 @@ class AIAgent:
         stream_kwargs["stream_options"] = {"include_usage": True}
 
         accumulated_content: list[str] = []
+        reasoning_so_far = ""
         accumulated_tool_calls: dict[int, dict] = {}  # index -> {id, name, arguments}
         final_usage = None
 
@@ -2094,6 +2116,13 @@ class AIAgent:
                             self.streaming_callback("".join(accumulated_content))
                         except Exception:
                             pass
+
+                reasoning_so_far = self._merge_stream_reasoning(reasoning_so_far, delta)
+                if reasoning_so_far and self.reasoning_callback:
+                    try:
+                        self.reasoning_callback(reasoning_so_far)
+                    except Exception:
+                        pass
 
                 # Tool call deltas — accumulate silently
                 if delta.tool_calls:
@@ -2156,6 +2185,7 @@ class AIAgent:
         stream_kwargs["stream_options"] = {"include_usage": True}
 
         accumulated_content: list[str] = []
+        reasoning_so_far = ""
         accumulated_tool_calls: dict[int, dict] = {}
         final_usage = None
 
@@ -2177,6 +2207,13 @@ class AIAgent:
                             self.streaming_callback("".join(accumulated_content))
                         except Exception:
                             pass
+
+                reasoning_so_far = self._merge_stream_reasoning(reasoning_so_far, delta)
+                if reasoning_so_far and self.reasoning_callback:
+                    try:
+                        self.reasoning_callback(reasoning_so_far)
+                    except Exception:
+                        pass
 
                 if delta.tool_calls:
                     for tc_delta in delta.tool_calls:
@@ -3161,6 +3198,8 @@ class AIAgent:
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            if self._agentscore_tracker:
+                self._agentscore_tracker.record_tool_call(is_error=_is_error_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
@@ -3421,7 +3460,10 @@ class AIAgent:
         self._turns_since_memory = 0
         self._iters_since_skill = 0
         self.iteration_budget = IterationBudget(self.max_iterations)
-        
+
+        if self._agentscore_tracker:
+            self._agentscore_tracker.start_session(self.model)
+
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
         
@@ -3980,7 +4022,10 @@ class AIAgent:
                         self.session_completion_tokens += completion_tokens
                         self.session_total_tokens += total_tokens
                         self.session_api_calls += 1
-                        
+
+                        if self._agentscore_tracker:
+                            self._agentscore_tracker.record_tokens(prompt_tokens, completion_tokens)
+
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                         
@@ -4770,7 +4815,10 @@ class AIAgent:
             "partial": False,  # True only when stopped due to invalid tool calls
             "interrupted": interrupted,
         }
-        
+
+        if self._agentscore_tracker:
+            self._agentscore_tracker.end_session(completed=completed)
+
         # Include interrupt message if one triggered the interrupt
         if interrupted and self._interrupt_message:
             result["interrupt_message"] = self._interrupt_message

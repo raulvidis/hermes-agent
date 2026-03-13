@@ -967,14 +967,23 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.edit_message_text(labels.get(mode, f"Streaming set to {mode}."))
         elif query.data.startswith("reasoning:"):
             mode = query.data.split(":", 1)[1]
-            chat_id = query.message.chat_id
-            self.set_reasoning_mode(chat_id, mode)
-            labels = {
-                "off": "⏹ Reasoning hidden.",
-                "on": "✅ Reasoning visible after completion.",
-                "stream": "✅ Reasoning: stream — live reasoning only.",
-            }
-            await query.edit_message_text(labels.get(mode, f"Reasoning set to {mode}."))
+            event = self._build_message_event(query.message, MessageType.COMMAND)
+            event.text = f"/reasoning {mode}"
+            response_text = None
+            if self._message_handler:
+                try:
+                    response_text = await self._message_handler(event)
+                except Exception:
+                    logger.exception("[%s] Failed to process reasoning callback", self.name)
+            if not response_text:
+                self.set_reasoning_mode(query.message.chat_id, mode)
+                fallback_labels = {
+                    "off": "Reasoning hidden for this chat.",
+                    "on": "Reasoning will be shown after the reply completes.",
+                    "stream": "Reasoning will stream live for this chat.",
+                }
+                response_text = fallback_labels.get(mode, f"Reasoning set to {mode}.")
+            await query.edit_message_text(response_text)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
