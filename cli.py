@@ -1519,7 +1519,7 @@ class HermesCLI:
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
-                pass_session_id=self.pass_session_id,
+                # pass_session_id removed from AIAgent; kept on CLI for compat
             )
             # Apply any pending title now that the session exists in the DB
             if self._pending_title and self._session_db:
