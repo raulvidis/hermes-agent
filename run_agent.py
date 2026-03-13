@@ -2172,7 +2172,11 @@ class AIAgent:
 
                 if delta.content:
                     accumulated_content.append(delta.content)
-                    self._emit_streaming_text("".join(accumulated_content))
+                    if self.streaming_callback:
+                        try:
+                            self.streaming_callback("".join(accumulated_content))
+                        except Exception:
+                            pass
 
                 if delta.tool_calls:
                     for tc_delta in delta.tool_calls:
