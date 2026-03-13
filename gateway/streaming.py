@@ -74,6 +74,7 @@ class TelegramDraftStream:
 
         self._state = StreamState()
         self._lock = Lock()
+        self._flush_lock = asyncio.Lock()
         self._pending = ""
         self._stopped = False
 
@@ -157,61 +158,62 @@ class TelegramDraftStream:
             return False
 
     async def _send_update(self, *, allow_stopped: bool = False) -> Optional[Dict[str, int]]:
-        if self._stopped and not allow_stopped:
+        async with self._flush_lock:
+            if self._stopped and not allow_stopped:
+                return None
+
+            with self._lock:
+                text = self._pending
+
+            if not text:
+                return None
+            if (
+                self._state.message_id is None
+                and len(text) < self._initial_min_chars
+                and not allow_stopped
+            ):
+                return None
+            if text == self._state.last_sent_text:
+                return None
+
+            formatted = self._format_text(text)
+            logger.debug("stream _send_update: len=%d msg_id=%s draft=%s", len(text), self._state.message_id, self.using_draft_transport)
+
+            # Try draft transport first (typing bubble effect in DMs)
+            if self.using_draft_transport:
+                if await self._send_draft(formatted):
+                    self._state.last_sent_text = text
+                    self._state.last_sent_time = time.time()
+                    return None  # No message_id for drafts
+
+            # Fallback: sendMessage / editMessageText
+            try:
+                if self._state.message_id is not None:
+                    result = await self._bot.edit_message_text(
+                        chat_id=self._chat_id,
+                        message_id=self._state.message_id,
+                        text=formatted,
+                        parse_mode=self._parse_mode,
+                    )
+                else:
+                    kwargs = {
+                        "chat_id": self._chat_id,
+                        "text": formatted,
+                        "parse_mode": self._parse_mode,
+                    }
+                    if self._thread_id is not None:
+                        kwargs["message_thread_id"] = self._thread_id
+                    result = await self._bot.send_message(**kwargs)
+
+                if result:
+                    self._state.message_id = result.message_id
+                    self._state.last_sent_text = text
+                    self._state.last_sent_time = time.time()
+                    return {"message_id": result.message_id}
+            except Exception as e:
+                logger.warning("Telegram draft stream error: %s", e)
+
             return None
-
-        with self._lock:
-            text = self._pending
-
-        if not text:
-            return None
-        if (
-            self._state.message_id is None
-            and len(text) < self._initial_min_chars
-            and not allow_stopped
-        ):
-            return None
-        if text == self._state.last_sent_text:
-            return None
-
-        formatted = self._format_text(text)
-        logger.debug("stream _send_update: len=%d msg_id=%s draft=%s", len(text), self._state.message_id, self.using_draft_transport)
-
-        # Try draft transport first (typing bubble effect in DMs)
-        if self.using_draft_transport:
-            if await self._send_draft(formatted):
-                self._state.last_sent_text = text
-                self._state.last_sent_time = time.time()
-                return None  # No message_id for drafts
-
-        # Fallback: sendMessage / editMessageText
-        try:
-            if self._state.message_id is not None:
-                result = await self._bot.edit_message_text(
-                    chat_id=self._chat_id,
-                    message_id=self._state.message_id,
-                    text=formatted,
-                    parse_mode=self._parse_mode,
-                )
-            else:
-                kwargs = {
-                    "chat_id": self._chat_id,
-                    "text": formatted,
-                    "parse_mode": self._parse_mode,
-                }
-                if self._thread_id is not None:
-                    kwargs["message_thread_id"] = self._thread_id
-                result = await self._bot.send_message(**kwargs)
-
-            if result:
-                self._state.message_id = result.message_id
-                self._state.last_sent_text = text
-                self._state.last_sent_time = time.time()
-                return {"message_id": result.message_id}
-        except Exception as e:
-            logger.warning("Telegram draft stream error: %s", e)
-
-        return None
 
 
 class StreamingManager:

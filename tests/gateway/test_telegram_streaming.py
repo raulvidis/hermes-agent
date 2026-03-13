@@ -107,6 +107,24 @@ def test_stream_start_materializes_initial_preview_for_cleanup():
     assert delete_result.message_id == "404"
 
 
+def test_concurrent_flushes_do_not_create_duplicate_preview_messages():
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=505))
+
+    stream = TelegramDraftStream(
+        bot=bot, chat_id=123, lane=StreamLane.ANSWER, use_draft_transport=False,
+    )
+    stream.update("hello")
+
+    async def _run():
+        await asyncio.gather(stream.flush(), stream.flush())
+
+    asyncio.run(_run())
+
+    bot.send_message.assert_awaited_once()
+    assert stream.message_id == 505
+
+
 def test_draft_transport_calls_do_api_request():
     """Draft transport should call do_api_request with sendMessageDraft."""
     bot = AsyncMock()
