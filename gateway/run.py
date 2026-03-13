@@ -847,7 +847,7 @@ class GatewayRunner:
                           "personality", "retry", "undo", "sethome", "set-home",
                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
                           "update", "title", "resume", "provider", "rollback",
-                          "background"}
+                          "background", "streaming"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -912,6 +912,9 @@ class GatewayRunner:
 
         if command == "background":
             return await self._handle_background_command(event)
+
+        if command == "streaming":
+            return await self._handle_streaming_command(event)
         
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -1545,6 +1548,7 @@ class GatewayRunner:
             "`/usage` — Show token usage for this session",
             "`/insights [days]` — Show usage insights and analytics",
             "`/rollback [number]` — List or restore filesystem checkpoints",
+            "`/streaming` — Toggle real-time streaming previews",
             "`/background <prompt>` — Run a prompt in a separate background session",
             "`/reload-mcp` — Reload MCP servers from config",
             "`/update` — Update Hermes Agent to the latest version",
@@ -1979,6 +1983,19 @@ class GatewayRunner:
                 f"A pre-rollback snapshot was saved automatically."
             )
         return f"❌ {result['error']}"
+
+    async def _handle_streaming_command(self, event: MessageEvent) -> str:
+        """Handle /streaming — toggle real-time streaming for this chat."""
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if not adapter or not hasattr(adapter, 'toggle_streaming'):
+            return "Streaming is not available on this platform."
+        chat_id = int(source.chat_id)
+        enabled = adapter.toggle_streaming(chat_id)
+        if enabled:
+            return "✅ Streaming enabled — you'll see real-time typing previews."
+        else:
+            return "⏹ Streaming disabled — responses will appear as complete messages."
 
     async def _handle_background_command(self, event: MessageEvent) -> str:
         """Handle /background <prompt> — run a prompt in a separate background session.
@@ -2987,8 +3004,8 @@ class GatewayRunner:
                     args_str = args_str[:197] + "..."
                 msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
             elif preview:
-                if len(preview) > 80:
-                    preview = preview[:77] + "..."
+                if len(preview) > 200:
+                    preview = preview[:197] + "..."
                 msg = f'{emoji} {tool_name}: "{preview}"'
             else:
                 msg = f"{emoji} {tool_name}..."
@@ -3021,7 +3038,13 @@ class GatewayRunner:
         async def send_streaming_updates():
             """Background task that updates the streaming message."""
             adapter = self.adapters.get(source.platform)
-            if not adapter or not getattr(adapter, "streaming_enabled", False):
+            streaming_on = False
+            if adapter:
+                if hasattr(adapter, 'streaming_enabled_for'):
+                    streaming_on = adapter.streaming_enabled_for(int(source.chat_id))
+                else:
+                    streaming_on = getattr(adapter, 'streaming_enabled', False)
+            if not streaming_on:
                 return
 
             stream_started = {StreamLane.ANSWER: False, StreamLane.REASONING: False}
@@ -3484,16 +3507,28 @@ class GatewayRunner:
                     except asyncio.CancelledError:
                         pass
 
-            # Delete streaming preview messages after the final response is sent.
+            # Delete streaming preview messages AFTER the caller sends the final
+            # response. Must be deferred so the preview isn't removed before the
+            # final message appears in the chat.
             if _preview_msg_ids_to_delete:
                 _adapter = self.adapters.get(source.platform)
                 if _adapter:
                     _chat = int(source.chat_id)
-                    for mid in _preview_msg_ids_to_delete:
-                        try:
-                            await _adapter.delete_message(chat_id=str(_chat), message_id=mid)
-                        except Exception as e:
-                            logger.debug("Preview delete failed (msg %s): %s", mid, e)
+
+                    async def _deferred_delete():
+                        await asyncio.sleep(0.5)
+                        for mid in _preview_msg_ids_to_delete:
+                            try:
+                                await _adapter.delete_message(chat_id=str(_chat), message_id=mid)
+                            except Exception as e:
+                                logger.debug("Preview delete failed (msg %s): %s", mid, e)
+
+                    def _log_task_error(t):
+                        if not t.cancelled() and (exc := t.exception()):
+                            logger.error("Deferred delete task failed: %s", exc)
+
+                    _task = asyncio.create_task(_deferred_delete())
+                    _task.add_done_callback(_log_task_error)
                 else:
                     logger.debug("No adapter for platform %s, skipping preview cleanup", source.platform)
 

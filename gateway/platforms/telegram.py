@@ -114,6 +114,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._streaming_manager: Optional[StreamingManager] = None
         self._streaming_enabled: bool = getattr(config, 'streaming_enabled', False)
+        self._streaming_chats: set[int] = set()  # Per-chat streaming toggle
 
     @property
     def bot(self) -> Optional[Bot]:
@@ -182,6 +183,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommand("insights", "Show usage insights and analytics"),
                     BotCommand("update", "Update Hermes to the latest version"),
                     BotCommand("reload_mcp", "Reload MCP servers from config"),
+                    BotCommand("streaming", "Toggle real-time streaming"),
                     BotCommand("help", "Show available commands"),
                 ])
             except Exception as e:
@@ -195,10 +197,10 @@ class TelegramAdapter(BasePlatformAdapter):
             self._running = True
             logger.info("[%s] Connected and polling for Telegram updates", self.name)
             
-            # Initialize streaming manager
+            # Always initialize streaming manager so /streaming command can toggle it
+            self._streaming_manager = StreamingManager(self, throttle_ms=250)
             if self._streaming_enabled:
-                self._streaming_manager = StreamingManager(self, throttle_ms=250)
-                logger.info("[%s] Streaming enabled for real-time message updates", self.name)
+                logger.info("[%s] Streaming enabled globally for real-time message updates", self.name)
             
             return True
             
@@ -530,10 +532,27 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._bot:
             await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
 
+    def streaming_enabled_for(self, chat_id: int) -> bool:
+        """Check if streaming is enabled for a specific chat."""
+        if not self._streaming_manager:
+            return False
+        if self._streaming_enabled:
+            return True
+        return chat_id in self._streaming_chats
+
     @property
     def streaming_enabled(self) -> bool:
-        """Check if streaming is enabled for this adapter."""
+        """Check if streaming is enabled globally."""
         return self._streaming_enabled and self._streaming_manager is not None
+
+    def toggle_streaming(self, chat_id: int) -> bool:
+        """Toggle streaming for a chat. Returns new state."""
+        if chat_id in self._streaming_chats:
+            self._streaming_chats.discard(chat_id)
+            return False
+        else:
+            self._streaming_chats.add(chat_id)
+            return True
 
     async def send_voice(
         self,
