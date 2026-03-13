@@ -85,6 +85,14 @@ def test_resolve_session_reasoning_config_enables_when_globally_disabled():
     assert resolved == {"enabled": True, "effort": "medium"}
 
 
+def test_format_reasoning_preview_italicizes_each_line():
+    runner, _, _ = _make_runner()
+
+    payload = runner._format_reasoning_preview("first line\n\nsecond line")
+
+    assert payload == "💭 **Reasoning**\n\n*first line*\n\n*second line*"
+
+
 @pytest.mark.asyncio
 async def test_delete_preview_message_deletes_transient_reasoning_bubble():
     runner, _, _ = _make_runner()

@@ -423,6 +423,15 @@ class GatewayRunner:
             pass
 
     @staticmethod
+    def _format_reasoning_preview(text: str) -> str:
+        """Format streamed reasoning as an italicized transient preview."""
+        body = "\n".join(
+            f"*{line}*" if line.strip() else ""
+            for line in (text or "").strip().splitlines()
+        ).strip()
+        return f"💭 **Reasoning**\n\n{body}" if body else ""
+
+    @staticmethod
     def _load_background_notifications_mode() -> str:
         """Load background process notification mode from config or env var.
 
@@ -2836,7 +2845,7 @@ class GatewayRunner:
                         except asyncio.QueueEmpty:
                             break
 
-                    payload = f"💭 **Reasoning**\n\n{latest_text.strip()}"
+                    payload = self._format_reasoning_preview(latest_text)
                     if not payload.strip():
                         continue
 
