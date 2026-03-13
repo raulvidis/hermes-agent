@@ -1,6 +1,7 @@
 """Tests for gateway /reasoning command behavior."""
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -82,3 +83,19 @@ def test_resolve_session_reasoning_config_enables_when_globally_disabled():
     resolved = runner._resolve_session_reasoning_config("on")
 
     assert resolved == {"enabled": True, "effort": "medium"}
+
+
+@pytest.mark.asyncio
+async def test_delete_preview_message_deletes_transient_reasoning_bubble():
+    runner, _, _ = _make_runner()
+    adapter = SimpleNamespace(delete_message=AsyncMock(return_value=True))
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="123",
+        chat_id="456",
+        user_name="tester",
+    )
+
+    await runner._delete_preview_message(adapter, source, "789")
+
+    adapter.delete_message.assert_awaited_once_with(chat_id="456", message_id="789")

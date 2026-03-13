@@ -413,6 +413,17 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """
+        Delete a previously sent message. Optional - platforms that don't
+        support deletion return False and callers should ignore the failure.
+        """
+        return False
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """
         Send a typing indicator.

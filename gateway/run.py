@@ -405,6 +405,23 @@ class GatewayRunner:
             return {"enabled": True, "effort": effort}
         return {"enabled": True, "effort": "medium"}
 
+    async def _delete_preview_message(
+        self,
+        adapter: BasePlatformAdapter,
+        source: SessionSource,
+        message_id: Optional[str],
+    ) -> None:
+        """Best-effort deletion for transient preview messages."""
+        if not message_id:
+            return
+        try:
+            await adapter.delete_message(
+                chat_id=source.chat_id,
+                message_id=message_id,
+            )
+        except Exception:
+            pass
+
     @staticmethod
     def _load_background_notifications_mode() -> str:
         """Load background process notification mode from config or env var.
@@ -2847,6 +2864,7 @@ class GatewayRunner:
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
+                    await self._delete_preview_message(adapter, source, reasoning_msg_id)
                     return
                 except Exception as e:
                     logger.error("Reasoning message error: %s", e)
