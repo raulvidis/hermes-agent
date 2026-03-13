@@ -1356,7 +1356,15 @@ class GatewayRunner:
             
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
-            
+
+            # Stash streaming preview IDs on the adapter so they get deleted
+            # after the final response message is sent (see base.py post-send hook).
+            _preview_ids = agent_result.get("preview_msg_ids", [])
+            if _preview_ids:
+                _adapter = self.adapters.get(source.platform)
+                if _adapter and hasattr(_adapter, '_pending_preview_deletes'):
+                    _adapter._pending_preview_deletes.setdefault(source.chat_id, []).extend(_preview_ids)
+
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
@@ -3050,21 +3058,13 @@ class GatewayRunner:
             stream_started = {StreamLane.ANSWER: False, StreamLane.REASONING: False}
             latest_text = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}
             progress_lines: list[str] = []
-            min_update_interval = 1.0
-            last_update_time = 0.0
 
-            async def _flush_latest(force: bool = False):
-                nonlocal last_update_time
+            async def _flush_latest():
                 answer_payload = _compose_stream_answer(latest_text[StreamLane.ANSWER], progress_lines)
                 pending_payloads = {
                     StreamLane.ANSWER: answer_payload,
                     StreamLane.REASONING: latest_text[StreamLane.REASONING].strip(),
                 }
-
-                now = callback_loop.time()
-                if not force and (now - last_update_time) < min_update_interval:
-                    return
-                last_update_time = now
 
                 for lane, payload in pending_payloads.items():
                     if not payload:
@@ -3088,7 +3088,7 @@ class GatewayRunner:
 
             while True:
                 try:
-                    update_type, text = await asyncio.wait_for(streaming_queue.get(), timeout=0.5)
+                    update_type, text = await asyncio.wait_for(streaming_queue.get(), timeout=0.25)
 
                     if update_type == "progress":
                         progress_lines.append(text)
@@ -3404,6 +3404,7 @@ class GatewayRunner:
                 "tools": tools_holder[0] or [],
                 "history_offset": len(agent_history),
                 "last_prompt_tokens": _last_prompt_toks,
+                "preview_msg_ids": list(_preview_msg_ids_to_delete),
             }
         
         # Start progress message sender if enabled
@@ -3506,31 +3507,6 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
-
-            # Delete streaming preview messages AFTER the caller sends the final
-            # response. Must be deferred so the preview isn't removed before the
-            # final message appears in the chat.
-            if _preview_msg_ids_to_delete:
-                _adapter = self.adapters.get(source.platform)
-                if _adapter:
-                    _chat = int(source.chat_id)
-
-                    async def _deferred_delete():
-                        await asyncio.sleep(0.5)
-                        for mid in _preview_msg_ids_to_delete:
-                            try:
-                                await _adapter.delete_message(chat_id=str(_chat), message_id=mid)
-                            except Exception as e:
-                                logger.debug("Preview delete failed (msg %s): %s", mid, e)
-
-                    def _log_task_error(t):
-                        if not t.cancelled() and (exc := t.exception()):
-                            logger.error("Deferred delete task failed: %s", exc)
-
-                    _task = asyncio.create_task(_deferred_delete())
-                    _task.add_done_callback(_log_task_error)
-                else:
-                    logger.debug("No adapter for platform %s, skipping preview cleanup", source.platform)
 
         return response
 

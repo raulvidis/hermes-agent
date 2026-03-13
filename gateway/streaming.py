@@ -41,7 +41,6 @@ class StreamState:
     message_id: Optional[int] = None
     last_sent_text: str = ""
     last_sent_time: float = 0.0
-    force_new_message: bool = False
 
 
 class TelegramDraftStream:
@@ -99,11 +98,6 @@ class TelegramDraftStream:
         """Coalesce pending text to the most recent version."""
         with self._lock:
             self._pending = text or ""
-
-    def force_new_message(self) -> None:
-        with self._lock:
-            self._state.force_new_message = True
-            self._state.message_id = None
 
     def stop(self) -> None:
         self._stopped = True
@@ -168,8 +162,6 @@ class TelegramDraftStream:
 
         with self._lock:
             text = self._pending
-            force_new = self._state.force_new_message
-            self._state.force_new_message = False
 
         if not text:
             return None
@@ -193,7 +185,7 @@ class TelegramDraftStream:
 
         # Fallback: sendMessage / editMessageText
         try:
-            if self._state.message_id is not None and not force_new:
+            if self._state.message_id is not None:
                 result = await self._bot.edit_message_text(
                     chat_id=self._chat_id,
                     message_id=self._state.message_id,
@@ -219,58 +211,6 @@ class TelegramDraftStream:
             logger.warning("Telegram draft stream error: %s", e)
 
         return None
-
-
-class ReasoningLaneCoordinator:
-    """Coordinates dual-lane streaming (answer + reasoning)."""
-
-    THINKING_TAG_RE = None
-
-    @classmethod
-    def _get_thinking_re(cls):
-        if cls.THINKING_TAG_RE is None:
-            import re
-
-            cls.THINKING_TAG_RE = re.compile(
-                r'<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>',
-                re.IGNORECASE,
-            )
-        return cls.THINKING_TAG_RE
-
-    @classmethod
-    def split_text(cls, text: str) -> Dict[str, str]:
-        if not text:
-            return {"reasoning": "", "answer": ""}
-
-        re_pattern = cls._get_thinking_re()
-        if not re_pattern.search(text):
-            if text.strip().startswith("Reasoning:"):
-                lines = text.split("\n", 1)
-                reasoning = lines[0].replace("Reasoning:", "").strip()
-                answer = lines[1].strip() if len(lines) > 1 else ""
-                return {"reasoning": reasoning, "answer": answer}
-            return {"reasoning": "", "answer": text}
-
-        reasoning_parts = []
-        answer_parts = []
-        last_index = 0
-        in_thinking = False
-        for match in re_pattern.finditer(text):
-            start, end = match.span()
-            segment = text[last_index:start]
-            if segment:
-                (reasoning_parts if in_thinking else answer_parts).append(segment)
-            in_thinking = match.group(1) != "/"
-            last_index = end
-
-        tail = text[last_index:]
-        if tail:
-            (reasoning_parts if in_thinking else answer_parts).append(tail)
-
-        return {
-            "reasoning": "".join(reasoning_parts).strip(),
-            "answer": "".join(answer_parts).strip(),
-        }
 
 
 class StreamingManager:

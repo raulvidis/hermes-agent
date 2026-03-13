@@ -345,11 +345,15 @@ class BasePlatformAdapter(ABC):
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
         self._running = False
-        
+
         # Track active message handlers per session for interrupt support
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+
+        # Streaming preview message IDs to delete after the final response is sent.
+        # Key: chat_id, Value: list of message IDs
+        self._pending_preview_deletes: Dict[str, List[int]] = {}
     
     @property
     def name(self) -> str:
@@ -418,6 +422,10 @@ class BasePlatformAdapter(ABC):
         sending a new message.
         """
         return SendResult(success=False, error="Not supported")
+
+    async def delete_message(self, chat_id: str, message_id: int) -> None:
+        """Delete a message. Override in subclasses that support deletion."""
+        pass
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
@@ -745,6 +753,16 @@ class BasePlatformAdapter(ABC):
                         )
                         if not fallback_result.success:
                             print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
+
+                    # Delete streaming preview messages now that the final
+                    # response has been sent (the user sees the real message).
+                    _chat_id = event.source.chat_id
+                    preview_ids = self._pending_preview_deletes.pop(_chat_id, [])
+                    for mid in preview_ids:
+                        try:
+                            await self.delete_message(chat_id=_chat_id, message_id=mid)
+                        except Exception as e:
+                            logger.debug("Preview delete failed (msg %s): %s", mid, e)
                 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()

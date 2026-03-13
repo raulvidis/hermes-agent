@@ -59,7 +59,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
-from gateway.streaming import StreamingManager, StreamLane, ReasoningLaneCoordinator
+from gateway.streaming import StreamingManager, StreamLane
 
 
 def check_telegram_requirements() -> bool:
@@ -453,44 +453,6 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[%s] Failed to end stream: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
-
-    async def stream_reasoning(
-        self,
-        chat_id: str,
-        reasoning_text: str,
-        answer_text: str,
-        thread_id: Optional[int] = None,
-    ) -> Dict[str, SendResult]:
-        """
-        Stream both reasoning and answer lanes simultaneously.
-        
-        This is a convenience method for the dual-lane streaming pattern.
-        Reasoning text appears in one message (italic), answer in another.
-        
-        Args:
-            chat_id: Target chat ID
-            reasoning_text: Thinking/reasoning content
-            answer_text: Main answer content
-            thread_id: Thread/topic ID for forum messages
-            
-        Returns:
-            Dict with 'reasoning' and 'answer' SendResults
-        """
-        results = {}
-        
-        # Update reasoning lane if there's reasoning content
-        if reasoning_text:
-            results["reasoning"] = await self.stream_update(
-                chat_id, reasoning_text, lane=StreamLane.REASONING
-            )
-        
-        # Update answer lane
-        if answer_text:
-            results["answer"] = await self.stream_update(
-                chat_id, answer_text, lane=StreamLane.ANSWER
-            )
-        
-        return results
 
     async def stream_delete(
         self,
