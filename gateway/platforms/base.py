@@ -413,7 +413,7 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
-    async def send_typing(self, chat_id: str) -> None:
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """
         Send a typing indicator.
         
@@ -620,7 +620,12 @@ class BasePlatformAdapter(ABC):
         
         return media, cleaned
     
-    async def _keep_typing(self, chat_id: str, interval: float = 2.0) -> None:
+    async def _keep_typing(
+        self,
+        chat_id: str,
+        interval: float = 2.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         Continuously send typing indicator until cancelled.
         
@@ -629,7 +634,11 @@ class BasePlatformAdapter(ABC):
         """
         try:
             while True:
-                await self.send_typing(chat_id)
+                try:
+                    await self.send_typing(chat_id, metadata=metadata)
+                except TypeError:
+                    # Older adapters may still expose send_typing(chat_id) only.
+                    await self.send_typing(chat_id)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
