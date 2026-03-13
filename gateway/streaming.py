@@ -1,7 +1,7 @@
 """
 Streaming infrastructure for real-time message updates.
 
-Implements a throttled draft stream loop similar to OpenClaw's approach:
+Implements a throttled draft stream loop:
 - Uses sendMessageDraft (unofficial Telegram API) in DMs for real-time
   typing effect, falls back to sendMessage/editMessageText in groups
 - Coalesced pending updates so we keep the newest state
