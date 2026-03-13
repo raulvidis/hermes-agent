@@ -369,6 +369,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=int(chat_id),
                 thread_id=thread_id,
                 lane=lane,
+                initial_min_chars=0,
             )
             
             if initial_text:
@@ -411,6 +412,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True)
         except Exception as e:
             logger.error("[%s] Failed to update stream: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def stream_flush(
+        self,
+        chat_id: str,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """Force an immediate flush of the pending stream text to Telegram."""
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+        try:
+            await self._streaming_manager.flush_stream(int(chat_id), lane)
+            return SendResult(success=True)
+        except Exception as e:
             return SendResult(success=False, error=str(e))
 
     async def stream_end(

@@ -2970,6 +2970,17 @@ class GatewayRunner:
                 return
             last_tool[0] = tool_name
 
+            # When streaming, rebuild preview with a longer limit so the
+            # typewriter effect has more text to reveal (default is 40 chars).
+            if telegram_stream_progress and args:
+                try:
+                    from agent.display import build_tool_preview as _btp
+                    longer = _btp(tool_name, args, max_len=120)
+                    if longer:
+                        preview = longer
+                except Exception:
+                    pass
+
             tool_emojis = {
                 "terminal": "💻",
                 "process": "⚙️",
@@ -3067,6 +3078,7 @@ class GatewayRunner:
             stream_started = False
             latest_text = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}
             progress_lines: list[str] = []
+            _has_flush = hasattr(adapter, 'stream_flush')
 
             async def _flush_latest():
                 nonlocal stream_started
@@ -3101,24 +3113,47 @@ class GatewayRunner:
 
                 await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
 
+            async def _typewriter(text: str):
+                """Reveal a progress line character-by-character via real Telegram edits."""
+                nonlocal stream_started
+                progress_lines.append("")
+                # Characters per step and delay control typing speed.
+                # ~2 chars every 40ms ≈ 50 chars/sec; a 60-char command takes ~1.2s.
+                chars_per_step = 2
+                delay = 0.04
+                for i in range(chars_per_step, len(text) + chars_per_step, chars_per_step):
+                    progress_lines[-1] = text[:i]
+                    # Set the pending text on the stream
+                    await _flush_latest()
+                    # Force the stream to actually send to Telegram NOW
+                    if _has_flush:
+                        await adapter.stream_flush(
+                            chat_id=source.chat_id,
+                            lane=StreamLane.ANSWER,
+                        )
+                    await asyncio.sleep(delay)
+                # Ensure full text is set (in case len wasn't divisible by step)
+                progress_lines[-1] = text
+
             while True:
                 try:
                     update_type, text = await asyncio.wait_for(streaming_queue.get(), timeout=0.25)
 
                     if update_type == "progress":
-                        progress_lines.append(text)
+                        await _typewriter(text)
                     elif update_type == "reasoning":
                         latest_text[StreamLane.REASONING] = text
                     else:
                         latest_text[StreamLane.ANSWER] = text
 
+                    # Drain any queued items that arrived during typewriter
                     while True:
                         try:
                             update_type, text = streaming_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
                         if update_type == "progress":
-                            progress_lines.append(text)
+                            await _typewriter(text)
                         elif update_type == "reasoning":
                             latest_text[StreamLane.REASONING] = text
                         else:
@@ -3508,12 +3543,12 @@ class GatewayRunner:
                 progress_task.cancel()
             streaming_task.cancel()
             interrupt_monitor.cancel()
-            
+
             # Clean up tracking
             tracking_task.cancel()
             if session_key and session_key in self._running_agents:
                 del self._running_agents[session_key]
-            
+
             # Wait for cancelled tasks
             for task in [progress_task, streaming_task, interrupt_monitor, tracking_task]:
                 if task:
@@ -3521,6 +3556,11 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+        # Update preview IDs AFTER streaming task has been cancelled and awaited,
+        # because the CancelledError handler populates _preview_msg_ids_to_delete.
+        if isinstance(response, dict) and _preview_msg_ids_to_delete:
+            response["preview_msg_ids"] = list(_preview_msg_ids_to_delete)
 
         return response
 

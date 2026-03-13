@@ -231,6 +231,7 @@ class StreamingManager:
         chat_id: int,
         thread_id: Optional[int] = None,
         lane: StreamLane = StreamLane.ANSWER,
+        initial_min_chars: int = 30,
     ) -> str:
         key = self.get_stream_key(chat_id, lane)
         await self.stop_stream(chat_id, lane)
@@ -241,6 +242,7 @@ class StreamingManager:
             lane=lane,
             thread_id=thread_id,
             throttle_ms=self._throttle_ms,
+            initial_min_chars=initial_min_chars,
         )
         self._streams[key] = stream
 
