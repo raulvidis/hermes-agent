@@ -24,7 +24,13 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
+
+
+GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
+    "Secure secret entry is not supported over messaging. "
+    "Run `hermes setup` or update ~/.hermes/.env locally."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -339,11 +345,15 @@ class BasePlatformAdapter(ABC):
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
         self._running = False
-        
+
         # Track active message handlers per session for interrupt support
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+
+        # Streaming preview message IDs to delete after the final response is sent.
+        # Key: chat_id, Value: list of message IDs
+        self._pending_preview_deletes: Dict[str, List[int]] = {}
     
     @property
     def name(self) -> str:
@@ -413,11 +423,16 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
-    async def send_typing(self, chat_id: str) -> None:
+    async def delete_message(self, chat_id: str, message_id: int) -> None:
+        """Delete a message. Override in subclasses that support deletion."""
+        pass
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
         
         Override in subclasses if the platform supports it.
+        metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
         """
         pass
     
@@ -515,6 +530,7 @@ class BasePlatformAdapter(ABC):
         audio_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
         """
         Send an audio file as a native voice message via the platform API.
@@ -534,6 +550,7 @@ class BasePlatformAdapter(ABC):
         video_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
         """
         Send a video natively via the platform API.
@@ -553,6 +570,7 @@ class BasePlatformAdapter(ABC):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
         """
         Send a document/file natively via the platform API.
@@ -571,6 +589,7 @@ class BasePlatformAdapter(ABC):
         image_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
         """
         Send a local image file natively via the platform API.
@@ -620,7 +639,7 @@ class BasePlatformAdapter(ABC):
         
         return media, cleaned
     
-    async def _keep_typing(self, chat_id: str, interval: float = 2.0) -> None:
+    async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
         """
         Continuously send typing indicator until cancelled.
         
@@ -629,7 +648,7 @@ class BasePlatformAdapter(ABC):
         """
         try:
             while True:
-                await self.send_typing(chat_id)
+                await self.send_typing(chat_id, metadata=metadata)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
@@ -645,7 +664,7 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
         
-        session_key = event.source.chat_id
+        session_key = build_session_key(event.source)
         
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
@@ -706,6 +725,20 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
                 
+                # Build metadata from the incoming event (e.g. forum thread_id)
+                _metadata = {}
+                if event.source.thread_id:
+                    _metadata["thread_id"] = event.source.thread_id
+                _send_meta = _metadata or None
+
+                async def _delete_preview_messages() -> None:
+                    preview_ids = self._pending_preview_deletes.pop(event.source.chat_id, [])
+                    for mid in preview_ids:
+                        try:
+                            await self.delete_message(chat_id=event.source.chat_id, message_id=mid)
+                        except Exception as e:
+                            logger.debug("[%s] Preview delete failed for %s: %s", self.name, mid, e)
+
                 # Send the text portion first (if any remains after extractions)
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
@@ -713,9 +746,9 @@ class BasePlatformAdapter(ABC):
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=event.message_id,
-                        metadata=_thread_metadata,
+                        metadata=_send_meta,
                     )
-                    
+
                     # Log send failures (don't raise - user already saw tool progress)
                     if not result.success:
                         print(f"[{self.name}] Failed to send response: {result.error}")
@@ -724,11 +757,11 @@ class BasePlatformAdapter(ABC):
                             chat_id=event.source.chat_id,
                             content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
                             reply_to=event.message_id,
-                            metadata=_thread_metadata,
+                            metadata=_send_meta,
                         )
                         if not fallback_result.success:
                             print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
-                
+
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
                 
@@ -799,6 +832,8 @@ class BasePlatformAdapter(ABC):
                             print(f"[{self.name}] Failed to send media ({ext}): {media_result.error}")
                     except Exception as media_err:
                         print(f"[{self.name}] Error sending media: {media_err}")
+
+                await _delete_preview_messages()
             
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:

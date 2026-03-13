@@ -235,6 +235,10 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert kwargs["tools"][0]["strict"] is False
     assert "function" not in kwargs["tools"][0]
     assert kwargs["store"] is False
+    assert kwargs["tool_choice"] == "auto"
+    assert kwargs["parallel_tool_calls"] is True
+    assert isinstance(kwargs["prompt_cache_key"], str)
+    assert len(kwargs["prompt_cache_key"]) > 0
     assert "timeout" not in kwargs
     assert "max_tokens" not in kwargs
     assert "extra_body" not in kwargs
@@ -325,6 +329,36 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_run_codex_stream_emits_streaming_callbacks(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    streamed = []
+    reasoned = []
+    agent.streaming_callback = lambda text, is_reasoning=False: streamed.append((text, is_reasoning))
+    agent.reasoning_callback = lambda text: reasoned.append(text)
+
+    class _EventfulResponsesStream(_FakeResponsesStream):
+        def __iter__(self):
+            return iter([
+                SimpleNamespace(type="response.reasoning_summary_text.delta", delta="thinking "),
+                SimpleNamespace(type="response.reasoning_summary_text.delta", delta="hard"),
+                SimpleNamespace(type="response.output_text.delta", delta="hello"),
+                SimpleNamespace(type="response.output_text.delta", delta=" world"),
+            ])
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _EventfulResponsesStream(final_response=_codex_message_response("final answer")),
+            create=lambda **kwargs: _codex_message_response("fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.output[0].content[0].text == "final answer"
+    assert reasoned == ["thinking ", "thinking hard"]
+    assert streamed == [("hello", False), ("hello world", False)]
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):

@@ -161,6 +161,7 @@ from gateway.session import (
 )
 from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.streaming import StreamLane
 
 logger = logging.getLogger(__name__)
 
@@ -185,6 +186,30 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "provider": runtime.get("provider"),
         "api_mode": runtime.get("api_mode"),
     }
+
+
+def _resolve_gateway_model() -> str:
+    """Read model from env/config — mirrors the resolution in _run_agent_sync.
+
+    Without this, temporary AIAgent instances (memory flush, /compress) fall
+    back to the hardcoded default ("anthropic/claude-opus-4.6") which fails
+    when the active provider is openai-codex.
+    """
+    model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
+    try:
+        import yaml as _y
+        _cfg_path = _hermes_home / "config.yaml"
+        if _cfg_path.exists():
+            with open(_cfg_path, encoding="utf-8") as _f:
+                _cfg = _y.safe_load(_f) or {}
+            _model_cfg = _cfg.get("model", {})
+            if isinstance(_model_cfg, str):
+                model = _model_cfg
+            elif isinstance(_model_cfg, dict):
+                model = _model_cfg.get("default", model)
+    except Exception:
+        pass
+    return model
 
 
 class GatewayRunner:
@@ -258,8 +283,14 @@ class GatewayRunner:
             if not runtime_kwargs.get("api_key"):
                 return
 
+            # Resolve model from config — AIAgent's default is OpenRouter-
+            # formatted ("anthropic/claude-opus-4.6") which fails when the
+            # active provider is openai-codex.
+            model = _resolve_gateway_model()
+
             tmp_agent = AIAgent(
                 **runtime_kwargs,
+                model=model,
                 max_iterations=8,
                 quiet_mode=True,
                 enabled_toolsets=["memory", "skills"],
@@ -672,6 +703,13 @@ class GatewayRunner:
                 return None
             return HomeAssistantAdapter(config)
 
+        elif platform == Platform.EMAIL:
+            from gateway.platforms.email import EmailAdapter, check_email_requirements
+            if not check_email_requirements():
+                logger.warning("Email: EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_IMAP_HOST, or EMAIL_SMTP_HOST not set")
+                return None
+            return EmailAdapter(config)
+
         return None
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -701,6 +739,7 @@ class GatewayRunner:
             Platform.WHATSAPP: "WHATSAPP_ALLOWED_USERS",
             Platform.SLACK: "SLACK_ALLOWED_USERS",
             Platform.SIGNAL: "SIGNAL_ALLOWED_USERS",
+            Platform.EMAIL: "EMAIL_ALLOWED_USERS",
         }
         platform_allow_all_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOW_ALL_USERS",
@@ -708,6 +747,7 @@ class GatewayRunner:
             Platform.WHATSAPP: "WHATSAPP_ALLOW_ALL_USERS",
             Platform.SLACK: "SLACK_ALLOW_ALL_USERS",
             Platform.SIGNAL: "SIGNAL_ALLOW_ALL_USERS",
+            Platform.EMAIL: "EMAIL_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -806,7 +846,8 @@ class GatewayRunner:
         _known_commands = {"new", "reset", "help", "status", "stop", "model",
                           "personality", "retry", "undo", "sethome", "set-home",
                           "compress", "usage", "insights", "reload-mcp", "reload_mcp",
-                          "update", "title", "resume", "provider", "rollback"}
+                          "update", "title", "resume", "provider", "rollback",
+                          "background", "streaming", "reasoning"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -868,7 +909,42 @@ class GatewayRunner:
 
         if command == "rollback":
             return await self._handle_rollback_command(event)
+
+        if command == "background":
+            return await self._handle_background_command(event)
+
+        if command == "streaming":
+            return await self._handle_streaming_command(event)
+
+        if command == "reasoning":
+            return await self._handle_reasoning_command(event)
         
+        # User-defined quick commands (bypass agent loop, no LLM call)
+        if command:
+            quick_commands = self.config.get("quick_commands", {})
+            if command in quick_commands:
+                qcmd = quick_commands[command]
+                if qcmd.get("type") == "exec":
+                    exec_cmd = qcmd.get("command", "")
+                    if exec_cmd:
+                        try:
+                            proc = await asyncio.create_subprocess_shell(
+                                exec_cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                            )
+                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                            output = (stdout or stderr).decode().strip()
+                            return output if output else "Command returned no output."
+                        except asyncio.TimeoutError:
+                            return "Quick command timed out (30s)."
+                        except Exception as e:
+                            return f"Quick command error: {e}"
+                    else:
+                        return f"Quick command '/{command}' has no command defined."
+                else:
+                    return f"Quick command '/{command}' has unsupported type (only 'exec' is supported)."
+
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
             try:
@@ -950,9 +1026,12 @@ class GatewayRunner:
         # repeated truncation/context failures.  Detect this early and
         # compress proactively — before the agent even starts.  (#628)
         #
-        # Thresholds are derived from the SAME compression config the
-        # agent uses (compression.threshold × model context length) so
-        # CLI and messaging platforms behave identically.
+        # Token source priority:
+        # 1. Actual API-reported prompt_tokens from the last turn
+        #    (stored in session_entry.last_prompt_tokens)
+        # 2. Rough char-based estimate (str(msg)//4) with a 1.4x
+        #    safety factor to account for overestimation on tool-heavy
+        #    conversations (code/JSON tokenizes at 5-7+ chars/token).
         # -----------------------------------------------------------------
         if history and len(history) >= 4:
             from agent.model_metadata import (
@@ -1003,31 +1082,48 @@ class GatewayRunner:
                 _compress_token_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct
                 )
-                # Warn if still huge after compression (95% of context)
                 _warn_token_threshold = int(_hyg_context_length * 0.95)
 
                 _msg_count = len(history)
-                _approx_tokens = estimate_messages_tokens_rough(history)
+
+                # Prefer actual API-reported tokens from the last turn
+                # (stored in session entry) over the rough char-based estimate.
+                # The rough estimate (str(msg)//4) overestimates by 30-50% on
+                # tool-heavy/code-heavy conversations, causing premature compression.
+                _stored_tokens = session_entry.last_prompt_tokens
+                if _stored_tokens > 0:
+                    _approx_tokens = _stored_tokens
+                    _token_source = "actual"
+                else:
+                    _approx_tokens = estimate_messages_tokens_rough(history)
+                    # Apply safety factor only for rough estimates
+                    _compress_token_threshold = int(
+                        _compress_token_threshold * 1.4
+                    )
+                    _warn_token_threshold = int(_warn_token_threshold * 1.4)
+                    _token_source = "estimated"
 
                 _needs_compress = _approx_tokens >= _compress_token_threshold
 
                 if _needs_compress:
                     logger.info(
-                        "Session hygiene: %s messages, ~%s tokens — auto-compressing "
+                        "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
                         "(threshold: %s%% of %s = %s tokens)",
-                        _msg_count, f"{_approx_tokens:,}",
+                        _msg_count, f"{_approx_tokens:,}", _token_source,
                         int(_hyg_threshold_pct * 100),
                         f"{_hyg_context_length:,}",
                         f"{_compress_token_threshold:,}",
                     )
 
                     _hyg_adapter = self.adapters.get(source.platform)
+                    _hyg_meta = {"thread_id": source.thread_id} if source.thread_id else None
                     if _hyg_adapter:
                         try:
                             await _hyg_adapter.send(
                                 source.chat_id,
                                 f"🗜️ Session is large ({_msg_count} messages, "
-                                f"~{_approx_tokens:,} tokens). Auto-compressing..."
+                                f"~{_approx_tokens:,} tokens). Auto-compressing...",
+                                metadata=_hyg_meta,
                             )
                         except Exception:
                             pass
@@ -1047,6 +1143,7 @@ class GatewayRunner:
                             if len(_hyg_msgs) >= 4:
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
+                                    model=_hyg_model,
                                     max_iterations=4,
                                     quiet_mode=True,
                                     enabled_toolsets=["memory"],
@@ -1065,6 +1162,8 @@ class GatewayRunner:
                                 self.session_store.rewrite_transcript(
                                     session_entry.session_id, _compressed
                                 )
+                                # Reset stored token count — transcript was rewritten
+                                session_entry.last_prompt_tokens = 0
                                 history = _compressed
                                 _new_count = len(_compressed)
                                 _new_tokens = estimate_messages_tokens_rough(
@@ -1085,7 +1184,8 @@ class GatewayRunner:
                                             f"🗜️ Compressed: {_msg_count} → "
                                             f"{_new_count} messages, "
                                             f"~{_approx_tokens:,} → "
-                                            f"~{_new_tokens:,} tokens"
+                                            f"~{_new_tokens:,} tokens",
+                                            metadata=_hyg_meta,
                                         )
                                     except Exception:
                                         pass
@@ -1105,7 +1205,8 @@ class GatewayRunner:
                                                 "after compression "
                                                 f"(~{_new_tokens:,} tokens). "
                                                 "Consider using /reset to start "
-                                                "fresh if you experience issues."
+                                                "fresh if you experience issues.",
+                                                metadata=_hyg_meta,
                                             )
                                         except Exception:
                                             pass
@@ -1117,6 +1218,7 @@ class GatewayRunner:
                         # Compression failed and session is dangerously large
                         if _approx_tokens >= _warn_token_threshold:
                             _hyg_adapter = self.adapters.get(source.platform)
+                            _hyg_meta = {"thread_id": source.thread_id} if source.thread_id else None
                             if _hyg_adapter:
                                 try:
                                     await _hyg_adapter.send(
@@ -1126,7 +1228,8 @@ class GatewayRunner:
                                         f"~{_approx_tokens:,} tokens) and "
                                         "auto-compression failed. Consider "
                                         "using /compress or /reset to avoid "
-                                        "issues."
+                                        "issues.",
+                                        metadata=_hyg_meta,
                                     )
                                 except Exception:
                                     pass
@@ -1256,12 +1359,32 @@ class GatewayRunner:
             
             response = agent_result.get("final_response", "")
             agent_messages = agent_result.get("messages", [])
-            
+            last_reasoning = (agent_result.get("last_reasoning", "") or "").strip()
+            reasoning_mode = getattr(session_entry, "reasoning_mode", "off")
+
+            # Stash streaming preview IDs on the adapter so they get deleted
+            # after the final response message is sent (see base.py post-send hook).
+            _preview_ids = agent_result.get("preview_msg_ids", [])
+            if _preview_ids:
+                _adapter = self.adapters.get(source.platform)
+                if _adapter and hasattr(_adapter, '_pending_preview_deletes'):
+                    _adapter._pending_preview_deletes.setdefault(source.chat_id, []).extend(_preview_ids)
+
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
             })
+
+            if reasoning_mode == "on" and last_reasoning:
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    _reasoning_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    await _adapter.send(
+                        source.chat_id,
+                        f"💭 **Reasoning**\n\n{last_reasoning}",
+                        metadata=_reasoning_meta,
+                    )
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -1322,6 +1445,11 @@ class GatewayRunner:
                         {"role": "assistant", "content": response, "timestamp": ts}
                     )
             else:
+                # The agent already persisted these messages to SQLite via
+                # _flush_messages_to_session_db(), so skip the DB write here
+                # to prevent the duplicate-write bug (#860).  We still write
+                # to JSONL for backward compatibility and as a backup.
+                agent_persisted = self._session_db is not None
                 for msg in new_messages:
                     # Skip system messages (they're rebuilt each run)
                     if msg.get("role") == "system":
@@ -1329,11 +1457,15 @@ class GatewayRunner:
                     # Add timestamp to each message for debugging
                     entry = {**msg, "timestamp": ts}
                     self.session_store.append_to_transcript(
-                        session_entry.session_id, entry
+                        session_entry.session_id, entry,
+                        skip_db=agent_persisted,
                     )
             
-            # Update session
-            self.session_store.update_session(session_entry.session_key)
+            # Update session with actual prompt token count from the agent
+            self.session_store.update_session(
+                session_entry.session_key,
+                last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+            )
             
             return response
             
@@ -1404,6 +1536,7 @@ class GatewayRunner:
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ]
         
+        lines.insert(-1, f"**Reasoning:** {getattr(session_entry, 'reasoning_mode', 'off')}")
         return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
@@ -1439,10 +1572,14 @@ class GatewayRunner:
             "`/usage` — Show token usage for this session",
             "`/insights [days]` — Show usage insights and analytics",
             "`/rollback [number]` — List or restore filesystem checkpoints",
+            "`/streaming` — Toggle real-time streaming previews",
+            "`/background <prompt>` — Run a prompt in a separate background session",
             "`/reload-mcp` — Reload MCP servers from config",
             "`/update` — Update Hermes Agent to the latest version",
             "`/help` — Show this message",
         ]
+        lines.insert(16, "`/reasoning [off|on|stream]` â€” Control reasoning visibility")
+        lines[16] = "`/reasoning [off|on|stream]` - Control reasoning visibility"
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
@@ -1672,14 +1809,39 @@ class GatewayRunner:
 
         if not args:
             lines = ["🎭 **Available Personalities**\n"]
+            lines.append("• `none` — (no personality overlay)")
             for name, prompt in personalities.items():
-                preview = prompt[:50] + "..." if len(prompt) > 50 else prompt
+                if isinstance(prompt, dict):
+                    preview = prompt.get("description") or prompt.get("system_prompt", "")[:50]
+                else:
+                    preview = prompt[:50] + "..." if len(prompt) > 50 else prompt
                 lines.append(f"• `{name}` — {preview}")
             lines.append(f"\nUsage: `/personality <name>`")
             return "\n".join(lines)
 
-        if args in personalities:
-            new_prompt = personalities[args]
+        def _resolve_prompt(value):
+            if isinstance(value, dict):
+                parts = [value.get("system_prompt", "")]
+                if value.get("tone"):
+                    parts.append(f'Tone: {value["tone"]}')
+                if value.get("style"):
+                    parts.append(f'Style: {value["style"]}')
+                return "\n".join(p for p in parts if p)
+            return str(value)
+
+        if args in ("none", "default", "neutral"):
+            try:
+                if "agent" not in config or not isinstance(config.get("agent"), dict):
+                    config["agent"] = {}
+                config["agent"]["system_prompt"] = ""
+                with open(config_path, "w") as f:
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+            except Exception as e:
+                return f"⚠️ Failed to save personality change: {e}"
+            self._ephemeral_system_prompt = ""
+            return "🎭 Personality cleared — using base agent behavior.\n_(takes effect on next message)_"
+        elif args in personalities:
+            new_prompt = _resolve_prompt(personalities[args])
 
             # Write to config.yaml, same pattern as CLI save_config_value.
             try:
@@ -1696,7 +1858,7 @@ class GatewayRunner:
 
             return f"🎭 Personality set to **{args}**\n_(takes effect on next message)_"
 
-        available = ", ".join(f"`{n}`" for n in personalities.keys())
+        available = "`none`, " + ", ".join(f"`{n}`" for n in personalities.keys())
         return f"Unknown personality: `{args}`\n\nAvailable: {available}"
     
     async def _handle_retry_command(self, event: MessageEvent) -> str:
@@ -1720,6 +1882,8 @@ class GatewayRunner:
         # Truncate history to before the last user message and persist
         truncated = history[:last_user_idx]
         self.session_store.rewrite_transcript(session_entry.session_id, truncated)
+        # Reset stored token count — transcript was truncated
+        session_entry.last_prompt_tokens = 0
         
         # Re-send by creating a fake text event with the old message
         retry_event = MessageEvent(
@@ -1751,6 +1915,8 @@ class GatewayRunner:
         removed_msg = history[last_user_idx].get("content", "")
         removed_count = len(history) - last_user_idx
         self.session_store.rewrite_transcript(session_entry.session_id, history[:last_user_idx])
+        # Reset stored token count — transcript was truncated
+        session_entry.last_prompt_tokens = 0
         
         preview = removed_msg[:40] + "..." if len(removed_msg) > 40 else removed_msg
         return f"↩️ Undid {removed_count} message(s).\nRemoved: \"{preview}\""
@@ -1844,6 +2010,282 @@ class GatewayRunner:
             )
         return f"❌ {result['error']}"
 
+    async def _handle_streaming_command(self, event: MessageEvent) -> str:
+        """Handle /streaming — show mode picker (off / on / detailed)."""
+        source = event.source
+        adapter = self.adapters.get(source.platform)
+        if not adapter or not hasattr(adapter, 'set_streaming_mode'):
+            return "Streaming is not available on this platform."
+
+        # Send inline keyboard for mode selection
+        try:
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            chat_id = int(source.chat_id)
+            current = adapter.streaming_mode_for(chat_id) if hasattr(adapter, 'streaming_mode_for') else "off"
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("off", callback_data="streaming:off"),
+                    InlineKeyboardButton("on", callback_data="streaming:on"),
+                    InlineKeyboardButton("detailed", callback_data="streaming:detailed"),
+                ]
+            ])
+            await adapter._bot.send_message(
+                chat_id=chat_id,
+                text=f"Choose streaming mode (current: <b>{current}</b>):",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            return ""  # Empty — we already sent the picker
+        except Exception:
+            # Fallback to simple toggle if inline keyboard fails
+            chat_id = int(source.chat_id)
+            enabled = adapter.toggle_streaming(chat_id)
+            if enabled:
+                return "✅ Streaming enabled — you'll see real-time typing previews."
+            else:
+                return "⏹ Streaming disabled — responses will appear as complete messages."
+
+    async def _handle_reasoning_command(self, event: MessageEvent) -> str:
+        """Handle /reasoning - control reasoning visibility for this session."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        adapter = self.adapters.get(source.platform)
+        arg = event.get_command_args().strip().lower()
+        valid_modes = {"off", "on", "stream"}
+
+        if not arg:
+            if source.platform == Platform.TELEGRAM and adapter and hasattr(adapter, "_bot"):
+                try:
+                    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                    chat_id = int(source.chat_id)
+                    current = getattr(session_entry, "reasoning_mode", "off")
+                    keyboard = InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("off", callback_data="reasoning:off"),
+                            InlineKeyboardButton("on", callback_data="reasoning:on"),
+                            InlineKeyboardButton("stream", callback_data="reasoning:stream"),
+                        ]
+                    ])
+                    await adapter._bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Choose reasoning mode (current: <b>{current}</b>):",
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                    return ""
+                except Exception:
+                    pass
+            return (
+                f"Current reasoning mode: `{getattr(session_entry, 'reasoning_mode', 'off')}`.\n"
+                "Usage: `/reasoning off`, `/reasoning on`, or `/reasoning stream`."
+            )
+
+        if arg not in valid_modes:
+            return "Unrecognized reasoning mode. Valid options: `off`, `on`, `stream`."
+
+        self.session_store.set_reasoning_mode(session_key, arg)
+        if adapter and hasattr(adapter, "set_reasoning_mode"):
+            adapter.set_reasoning_mode(int(source.chat_id), arg)
+
+        labels = {
+            "off": "Reasoning hidden for this chat.",
+            "on": "Reasoning will be shown after the reply completes.",
+            "stream": "Reasoning will stream live for this chat.",
+        }
+        return labels[arg]
+
+    async def _handle_background_command(self, event: MessageEvent) -> str:
+        """Handle /background <prompt> — run a prompt in a separate background session.
+
+        Spawns a new AIAgent in a background thread with its own session.
+        When it completes, sends the result back to the same chat without
+        modifying the active session's conversation history.
+        """
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return (
+                "Usage: /background <prompt>\n"
+                "Example: /background Summarize the top HN stories today\n\n"
+                "Runs the prompt in a separate session. "
+                "You can keep chatting — the result will appear here when done."
+            )
+
+        source = event.source
+        task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+
+        # Fire-and-forget the background task
+        asyncio.create_task(
+            self._run_background_task(prompt, source, task_id)
+        )
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
+
+    async def _run_background_task(
+        self, prompt: str, source: "SessionSource", task_id: str
+    ) -> None:
+        """Execute a background agent task and deliver the result to the chat."""
+        from run_agent import AIAgent
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            return
+
+        _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            if not runtime_kwargs.get("api_key"):
+                await adapter.send(
+                    source.chat_id,
+                    f"❌ Background task {task_id} failed: no provider credentials configured.",
+                    metadata=_thread_metadata,
+                )
+                return
+
+            # Read model from config via shared helper
+            model = _resolve_gateway_model()
+
+            # Determine toolset (same logic as _run_agent)
+            default_toolset_map = {
+                Platform.LOCAL: "hermes-cli",
+                Platform.TELEGRAM: "hermes-telegram",
+                Platform.DISCORD: "hermes-discord",
+                Platform.WHATSAPP: "hermes-whatsapp",
+                Platform.SLACK: "hermes-slack",
+                Platform.SIGNAL: "hermes-signal",
+                Platform.HOMEASSISTANT: "hermes-homeassistant",
+                Platform.EMAIL: "hermes-email",
+            }
+            platform_toolsets_config = {}
+            try:
+                config_path = _hermes_home / 'config.yaml'
+                if config_path.exists():
+                    import yaml
+                    with open(config_path, 'r', encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                    platform_toolsets_config = user_config.get("platform_toolsets", {})
+            except Exception:
+                pass
+
+            platform_config_key = {
+                Platform.LOCAL: "cli",
+                Platform.TELEGRAM: "telegram",
+                Platform.DISCORD: "discord",
+                Platform.WHATSAPP: "whatsapp",
+                Platform.SLACK: "slack",
+                Platform.SIGNAL: "signal",
+                Platform.HOMEASSISTANT: "homeassistant",
+                Platform.EMAIL: "email",
+            }.get(source.platform, "telegram")
+
+            config_toolsets = platform_toolsets_config.get(platform_config_key)
+            if config_toolsets and isinstance(config_toolsets, list):
+                enabled_toolsets = config_toolsets
+            else:
+                default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
+                enabled_toolsets = [default_toolset]
+
+            platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+
+            pr = self._provider_routing
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+
+            def run_sync():
+                agent = AIAgent(
+                    model=model,
+                    **runtime_kwargs,
+                    max_iterations=max_iterations,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=enabled_toolsets,
+                    reasoning_config=self._reasoning_config,
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=task_id,
+                    platform=platform_key,
+                    session_db=self._session_db,
+                    fallback_model=self._fallback_model,
+                )
+
+                return agent.run_conversation(
+                    user_message=prompt,
+                    task_id=task_id,
+                )
+
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, run_sync)
+
+            response = result.get("final_response", "") if result else ""
+            if not response and result and result.get("error"):
+                response = f"Error: {result['error']}"
+
+            # Extract media files from the response
+            if response:
+                media_files, response = adapter.extract_media(response)
+                images, text_content = adapter.extract_images(response)
+
+                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+
+                if text_content:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=header + text_content,
+                        metadata=_thread_metadata,
+                    )
+                elif not images and not media_files:
+                    await adapter.send(
+                        chat_id=source.chat_id,
+                        content=header + "(No response generated)",
+                        metadata=_thread_metadata,
+                    )
+
+                # Send extracted images
+                for image_url, alt_text in (images or []):
+                    try:
+                        await adapter.send_image(
+                            chat_id=source.chat_id,
+                            image_url=image_url,
+                            caption=alt_text,
+                        )
+                    except Exception:
+                        pass
+
+                # Send media files
+                for media_path in (media_files or []):
+                    try:
+                        await adapter.send_file(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                        )
+                    except Exception:
+                        pass
+            else:
+                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    metadata=_thread_metadata,
+                )
+
+        except Exception as e:
+            logger.exception("Background task %s failed", task_id)
+            try:
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ Background task {task_id} failed: {e}",
+                    metadata=_thread_metadata,
+                )
+            except Exception:
+                pass
+
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context."""
         source = event.source
@@ -1861,6 +2303,9 @@ class GatewayRunner:
             if not runtime_kwargs.get("api_key"):
                 return "No provider configured -- cannot compress."
 
+            # Resolve model from config (same reason as memory flush above).
+            model = _resolve_gateway_model()
+
             msgs = [
                 {"role": m.get("role"), "content": m.get("content")}
                 for m in history
@@ -1871,6 +2316,7 @@ class GatewayRunner:
 
             tmp_agent = AIAgent(
                 **runtime_kwargs,
+                model=model,
                 max_iterations=4,
                 quiet_mode=True,
                 enabled_toolsets=["memory"],
@@ -1884,6 +2330,10 @@ class GatewayRunner:
             )
 
             self.session_store.rewrite_transcript(session_entry.session_id, compressed)
+            # Reset stored token count — transcript changed, old value is stale
+            self.session_store.update_session(
+                session_entry.session_key, last_prompt_tokens=0,
+            )
             new_count = len(compressed)
             new_tokens = estimate_messages_tokens_rough(compressed)
 
@@ -2525,6 +2975,7 @@ class GatewayRunner:
             Platform.SLACK: "hermes-slack",
             Platform.SIGNAL: "hermes-signal",
             Platform.HOMEASSISTANT: "hermes-homeassistant",
+            Platform.EMAIL: "hermes-email",
         }
         
         # Try to load platform_toolsets from config
@@ -2548,6 +2999,7 @@ class GatewayRunner:
             Platform.SLACK: "slack",
             Platform.SIGNAL: "signal",
             Platform.HOMEASSISTANT: "homeassistant",
+            Platform.EMAIL: "email",
         }.get(source.platform, "telegram")
         
         # Use config override if present (list of toolsets), otherwise hardcoded default
@@ -2576,22 +3028,60 @@ class GatewayRunner:
             or "all"
         )
         tool_progress_enabled = progress_mode != "off"
-        
-        # Queue for progress messages (thread-safe)
-        progress_queue = queue.Queue() if tool_progress_enabled else None
-        last_tool = [None]  # Mutable container for tracking in closure
-        
+        callback_loop = asyncio.get_running_loop()
+        # Route tool progress to the streaming preview (merged with answer text)
+        # only when streaming is actually enabled for this chat.
+        _tg_adapter = self.adapters.get(source.platform)
+        telegram_stream_progress = False
+        _streaming_mode = "off"  # "off", "on" (tool logs only), "detailed" (logs + answer)
+        if _tg_adapter:
+            if hasattr(_tg_adapter, 'streaming_mode_for'):
+                try:
+                    _streaming_mode = _tg_adapter.streaming_mode_for(int(source.chat_id))
+                except (ValueError, TypeError):
+                    pass
+            elif hasattr(_tg_adapter, 'streaming_enabled_for'):
+                try:
+                    if _tg_adapter.streaming_enabled_for(int(source.chat_id)):
+                        _streaming_mode = "detailed"
+                except (ValueError, TypeError):
+                    pass
+            elif getattr(_tg_adapter, "streaming_enabled", False):
+                _streaming_mode = "detailed"
+        telegram_stream_progress = _streaming_mode != "off"
+
+        progress_queue: Optional[asyncio.Queue[str]] = asyncio.Queue() if tool_progress_enabled else None
+        streaming_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        last_tool = [None]
+
+        def _queue_put_threadsafe(target_queue, item) -> None:
+            if target_queue is None:
+                return
+            try:
+                callback_loop.call_soon_threadsafe(target_queue.put_nowait, item)
+            except RuntimeError:
+                pass
+
         def progress_callback(tool_name: str, preview: str = None, args: dict = None):
             """Callback invoked by agent when a tool is called."""
-            if not progress_queue:
+            if not tool_progress_enabled:
                 return
-            
-            # "new" mode: only report when tool changes
+
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
-            # Build progress message with primary argument preview
+
+            # When streaming, rebuild preview with a longer limit so the
+            # typewriter effect has more text to reveal (default is 40 chars).
+            if telegram_stream_progress and args:
+                try:
+                    from agent.display import build_tool_preview as _btp
+                    longer = _btp(tool_name, args, max_len=120)
+                    if longer:
+                        preview = longer
+                except Exception:
+                    pass
+
             tool_emojis = {
                 "terminal": "💻",
                 "process": "⚙️",
@@ -2633,30 +3123,182 @@ class GatewayRunner:
                 "skill_manage": "📝",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
-            
-            # Verbose mode: show detailed arguments
+
             if progress_mode == "verbose" and args:
                 import json as _json
+
                 args_str = _json.dumps(args, ensure_ascii=False, default=str)
                 if len(args_str) > 200:
                     args_str = args_str[:197] + "..."
                 msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                progress_queue.put(msg)
-                return
-            
-            if preview:
-                # Truncate preview to keep messages clean
-                if len(preview) > 80:
-                    preview = preview[:77] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+            elif preview:
+                if len(preview) > 200:
+                    preview = preview[:197] + "..."
+                msg = f'{emoji} {tool_name}: "{preview}"'
             else:
                 msg = f"{emoji} {tool_name}..."
-            
-            progress_queue.put(msg)
-        
-        # Background task to send progress messages
-        # Accumulates tool lines into a single message that gets edited
+
+            if telegram_stream_progress:
+                _queue_put_threadsafe(streaming_queue, ("progress", msg))
+            else:
+                _queue_put_threadsafe(progress_queue, msg)
+
+        def streaming_callback(text: str, is_reasoning: bool = False):
+            """Callback invoked by agent when streaming text is available."""
+            if is_reasoning:
+                if _reasoning_mode != "stream":
+                    return
+                _queue_put_threadsafe(streaming_queue, ("reasoning", text or ""))
+                return
+            if _streaming_mode != "detailed":
+                return  # "on" mode only shows tool logs, not answer text
+            _queue_put_threadsafe(streaming_queue, ("text", text or ""))
+
+        def reasoning_stream_callback(text: str):
+            streaming_callback(text, is_reasoning=True)
+
+        _stream_metadata = {"thread_id": source.thread_id} if source.thread_id else None
         _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _preview_msg_ids_to_delete: list[int] = []  # Filled on cancel, deleted after final send
+        _reasoning_mode = getattr(self.session_store.get_or_create_session(source), "reasoning_mode", "off")
+        _adapter_for_reasoning = self.adapters.get(source.platform)
+        if _adapter_for_reasoning and hasattr(_adapter_for_reasoning, "set_reasoning_mode"):
+            _adapter_for_reasoning.set_reasoning_mode(int(source.chat_id), _reasoning_mode)
+
+        def _compose_stream_answer(answer_text: str, progress_lines: list[str]) -> str:
+            answer_text = (answer_text or "").strip()
+            if not progress_lines:
+                return answer_text
+            progress_block = "\n".join(progress_lines)
+            if answer_text:
+                return f"Running:\n{progress_block}\n\n{answer_text}"
+            return f"Running:\n{progress_block}"
+
+        async def send_streaming_updates():
+            """Background task that updates the streaming message."""
+            adapter = self.adapters.get(source.platform)
+            streaming_on = False
+            if adapter:
+                if hasattr(adapter, 'streaming_enabled_for'):
+                    streaming_on = adapter.streaming_enabled_for(int(source.chat_id))
+                else:
+                    streaming_on = getattr(adapter, 'streaming_enabled', False)
+            logger.debug("send_streaming_updates: streaming_on=%s for chat %s", streaming_on, source.chat_id)
+            if not streaming_on:
+                return
+
+            stream_started = False
+            latest_text = {StreamLane.ANSWER: "", StreamLane.REASONING: ""}
+            progress_lines: list[str] = []
+            _has_flush = hasattr(adapter, 'stream_flush')
+
+            async def _flush_latest():
+                nonlocal stream_started
+                show_reasoning = _reasoning_mode == "stream"
+                show_answer = _streaming_mode == "detailed"
+                show_progress = _streaming_mode in ("on", "detailed")
+                reasoning = latest_text[StreamLane.REASONING].strip() if show_reasoning else ""
+                answer = ""
+                if show_answer or show_progress:
+                    answer = _compose_stream_answer(
+                        latest_text[StreamLane.ANSWER] if show_answer else "",
+                        progress_lines if show_progress else [],
+                    )
+
+                parts = []
+                if reasoning:
+                    parts.append(f"💭 {reasoning}")
+                if answer:
+                    parts.append(answer)
+                payload = "\n\n".join(parts)
+                if not payload:
+                    return
+
+                lane = StreamLane.ANSWER
+                if not stream_started:
+                    result = await adapter.stream_start(
+                        chat_id=source.chat_id,
+                        initial_text=payload,
+                        thread_id=source.thread_id,
+                        lane=lane,
+                    )
+                    stream_started = bool(result.success)
+                else:
+                    await adapter.stream_update(
+                        chat_id=source.chat_id,
+                        text=payload,
+                        lane=lane,
+                    )
+
+                await adapter.send_typing(source.chat_id, metadata=_stream_metadata)
+
+            async def _typewriter(text: str):
+                """Reveal a progress line character-by-character via real Telegram edits."""
+                nonlocal stream_started
+                progress_lines.append("")
+                # Characters per step and delay control typing speed.
+                # ~2 chars every 40ms ≈ 50 chars/sec; a 60-char command takes ~1.2s.
+                chars_per_step = 2
+                delay = 0.04
+                for i in range(chars_per_step, len(text) + chars_per_step, chars_per_step):
+                    progress_lines[-1] = text[:i]
+                    # Set the pending text on the stream
+                    await _flush_latest()
+                    # Force the stream to actually send to Telegram NOW
+                    if _has_flush:
+                        await adapter.stream_flush(
+                            chat_id=source.chat_id,
+                            lane=StreamLane.ANSWER,
+                        )
+                    await asyncio.sleep(delay)
+                # Ensure full text is set (in case len wasn't divisible by step)
+                progress_lines[-1] = text
+
+            while True:
+                try:
+                    update_type, text = await asyncio.wait_for(streaming_queue.get(), timeout=0.25)
+
+                    if update_type == "progress":
+                        await _typewriter(text)
+                    elif update_type == "reasoning":
+                        latest_text[StreamLane.REASONING] = text
+                    else:
+                        latest_text[StreamLane.ANSWER] = text
+
+                    # Drain any queued items that arrived during typewriter
+                    while True:
+                        try:
+                            update_type, text = streaming_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if update_type == "progress":
+                            await _typewriter(text)
+                        elif update_type == "reasoning":
+                            latest_text[StreamLane.REASONING] = text
+                        else:
+                            latest_text[StreamLane.ANSWER] = text
+
+                    await _flush_latest()
+                except asyncio.TimeoutError:
+                    await _flush_latest()
+                except asyncio.CancelledError:
+                    # Discard stream without flushing or deleting yet.
+                    # Stash message IDs so they can be deleted AFTER the
+                    # final response is sent (avoids visual flash).
+                    if stream_started:
+                        try:
+                            result = await adapter.stream_delete(
+                                chat_id=source.chat_id, lane=StreamLane.ANSWER,
+                                deferred=True,
+                            )
+                            if result.success and result.message_id:
+                                _preview_msg_ids_to_delete.append(int(result.message_id))
+                        except Exception as e:
+                            logger.debug("stream_delete error: %s", e)
+                    return
+                except Exception as e:
+                    logger.debug("Streaming update error: %s", e)
+                    await asyncio.sleep(0.5)
 
         async def send_progress_messages():
             if not progress_queue:
@@ -2666,17 +3308,16 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            progress_lines = []      # Accumulated tool lines
-            progress_msg_id = None   # ID of the progress message to edit
-            can_edit = True          # False once an edit fails (platform doesn't support it)
+            progress_lines = []
+            progress_msg_id = None
+            can_edit = True
 
             while True:
                 try:
-                    msg = progress_queue.get_nowait()
+                    msg = await asyncio.wait_for(progress_queue.get(), timeout=0.3)
                     progress_lines.append(msg)
 
                     if can_edit and progress_msg_id is not None:
-                        # Try to edit the existing progress message
                         full_text = "\n".join(progress_lines)
                         result = await adapter.edit_message(
                             chat_id=source.chat_id,
@@ -2684,43 +3325,30 @@ class GatewayRunner:
                             content=full_text,
                         )
                         if not result.success:
-                            # Platform doesn't support editing — stop trying,
-                            # send just this new line as a separate message
                             can_edit = False
                             await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                     else:
-                        if can_edit:
-                            # First tool: send all accumulated text as new message
-                            full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
-                        else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                        full_text = "\n".join(progress_lines) if can_edit else msg
+                        result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
-                    # Restore typing indicator
                     await asyncio.sleep(0.3)
-                    await adapter.send_typing(source.chat_id)
-
-                except queue.Empty:
-                    await asyncio.sleep(0.3)
+                    await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                except asyncio.TimeoutError:
+                    continue
                 except asyncio.CancelledError:
-                    # Drain remaining queued messages
-                    while not progress_queue.empty():
+                    while True:
                         try:
-                            msg = progress_queue.get_nowait()
-                            progress_lines.append(msg)
-                        except Exception:
+                            progress_lines.append(progress_queue.get_nowait())
+                        except asyncio.QueueEmpty:
                             break
-                    # Final edit with all remaining tools (only if editing works)
                     if can_edit and progress_lines and progress_msg_id:
-                        full_text = "\n".join(progress_lines)
                         try:
                             await adapter.edit_message(
                                 chat_id=source.chat_id,
                                 message_id=progress_msg_id,
-                                content=full_text,
+                                content="\n".join(progress_lines),
                             )
                         except Exception:
                             pass
@@ -2728,7 +3356,7 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
-        
+
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
@@ -2779,21 +3407,7 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
-
-            try:
-                import yaml as _y
-                _cfg_path = _hermes_home / "config.yaml"
-                if _cfg_path.exists():
-                    with open(_cfg_path, encoding="utf-8") as _f:
-                        _cfg = _y.safe_load(_f) or {}
-                    _model_cfg = _cfg.get("model", {})
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        model = _model_cfg.get("default", model)
-            except Exception:
-                pass
+            model = _resolve_gateway_model()
 
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs()
@@ -2825,6 +3439,8 @@ class GatewayRunner:
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
                 step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
+                streaming_callback=streaming_callback,
+                reasoning_callback=reasoning_stream_callback,
                 platform=platform_key,
                 honcho_session_key=session_key,
                 session_db=self._session_db,
@@ -2896,14 +3512,24 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            last_reasoning = result.get("last_reasoning")
+
+            # Extract last actual prompt token count from the agent's compressor
+            _last_prompt_toks = 0
+            _agent = agent_holder[0]
+            if _agent and hasattr(_agent, "context_compressor"):
+                _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
+
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
                 return {
                     "final_response": error_msg,
+                    "last_reasoning": last_reasoning,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
+                    "last_prompt_tokens": _last_prompt_toks,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -2943,16 +3569,22 @@ class GatewayRunner:
             
             return {
                 "final_response": final_response,
+                "last_reasoning": last_reasoning,
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
                 "history_offset": len(agent_history),
+                "last_prompt_tokens": _last_prompt_toks,
+                "preview_msg_ids": list(_preview_msg_ids_to_delete),
             }
         
         # Start progress message sender if enabled
         progress_task = None
         if tool_progress_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
+        
+        # Start streaming updates task
+        streaming_task = asyncio.create_task(send_streaming_updates())
         
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created
@@ -3028,24 +3660,30 @@ class GatewayRunner:
                     session_key=session_key
                 )
         finally:
-            # Stop progress sender and interrupt monitor
+            # Stop progress sender, streaming, and interrupt monitor
             if progress_task:
                 progress_task.cancel()
+            streaming_task.cancel()
             interrupt_monitor.cancel()
-            
+
             # Clean up tracking
             tracking_task.cancel()
             if session_key and session_key in self._running_agents:
                 del self._running_agents[session_key]
-            
+
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task]:
+            for task in [progress_task, streaming_task, interrupt_monitor, tracking_task]:
                 if task:
                     try:
                         await task
                     except asyncio.CancelledError:
                         pass
-        
+
+        # Update preview IDs AFTER streaming task has been cancelled and awaited,
+        # because the CancelledError handler populates _preview_msg_ids_to_delete.
+        if isinstance(response, dict) and _preview_msg_ids_to_delete:
+            response["preview_msg_ids"] = list(_preview_msg_ids_to_delete)
+
         return response
 
 

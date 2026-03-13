@@ -16,11 +16,12 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
         Application,
         CommandHandler,
         MessageHandler as TelegramMessageHandler,
+        CallbackQueryHandler,
         ContextTypes,
         filters,
     )
@@ -59,6 +60,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
+from gateway.streaming import StreamingManager, StreamLane
 
 
 def check_telegram_requirements() -> bool:
@@ -101,24 +103,39 @@ class TelegramAdapter(BasePlatformAdapter):
     - Sending responses with Telegram markdown
     - Forum topics (thread_id support)
     - Media messages
+    - Reply threading modes (off/first/all)
     """
     
-    # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        self._streaming_manager: Optional[StreamingManager] = None
+        self._streaming_enabled: bool = getattr(config, 'streaming_enabled', False)
+        # Per-chat streaming mode: "off", "on" (tool logs), "detailed" (logs + answer/reasoning)
+        self._streaming_chat_modes: dict[int, str] = {}
+        # Per-chat reasoning visibility: "off", "on", "stream"
+        self._reasoning_chat_modes: dict[int, str] = {}
+
+    @property
+    def bot(self) -> Optional[Bot]:
+        """Expose the underlying bot for streaming helpers without leaking mutability."""
+        return self._bot
     
     async def connect(self) -> bool:
         """Connect to Telegram and start polling for updates."""
         if not TELEGRAM_AVAILABLE:
-            print(f"[{self.name}] python-telegram-bot not installed. Run: pip install python-telegram-bot")
+            logger.error(
+                "[%s] python-telegram-bot not installed. Run: pip install python-telegram-bot",
+                self.name,
+            )
             return False
         
         if not self.config.token:
-            print(f"[{self.name}] No bot token configured")
+            logger.error("[%s] No bot token configured", self.name)
             return False
         
         try:
@@ -143,7 +160,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
-            
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
             # Start polling in background
             await self._app.initialize()
             await self._app.start()
@@ -170,17 +188,30 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommand("insights", "Show usage insights and analytics"),
                     BotCommand("update", "Update Hermes to the latest version"),
                     BotCommand("reload_mcp", "Reload MCP servers from config"),
+                    BotCommand("reasoning", "Toggle reasoning visibility"),
+                    BotCommand("streaming", "Toggle real-time streaming"),
                     BotCommand("help", "Show available commands"),
                 ])
             except Exception as e:
-                print(f"[{self.name}] Could not register command menu: {e}")
+                logger.warning(
+                    "[%s] Could not register Telegram command menu: %s",
+                    self.name,
+                    e,
+                    exc_info=True,
+                )
             
             self._running = True
-            print(f"[{self.name}] Connected and polling for updates")
+            logger.info("[%s] Connected and polling for Telegram updates", self.name)
+            
+            # Always initialize streaming manager so /streaming command can toggle it
+            self._streaming_manager = StreamingManager(self, throttle_ms=250)
+            if self._streaming_enabled:
+                logger.info("[%s] Streaming enabled globally for real-time message updates", self.name)
+            
             return True
             
         except Exception as e:
-            print(f"[{self.name}] Failed to connect: {e}")
+            logger.error("[%s] Failed to connect to Telegram: %s", self.name, e, exc_info=True)
             return False
     
     async def disconnect(self) -> None:
@@ -191,13 +222,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._app.stop()
                 await self._app.shutdown()
             except Exception as e:
-                print(f"[{self.name}] Error during disconnect: {e}")
+                logger.warning("[%s] Error during Telegram disconnect: %s", self.name, e, exc_info=True)
         
         self._running = False
         self._app = None
         self._bot = None
-        print(f"[{self.name}] Disconnected")
+        logger.info("[%s] Disconnected from Telegram", self.name)
     
+    def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
+        """
+        Determine if this message chunk should thread to the original message.
+
+        Args:
+            reply_to: The original message ID to reply to
+            chunk_index: Index of this chunk (0 = first chunk)
+
+        Returns:
+            True if this chunk should be threaded to the original message
+        """
+        if not reply_to:
+            return False
+        
+        mode = self._reply_to_mode
+        if mode == "off":
+            return False
+        elif mode == "all":
+            return True
+        else:  # "first" (default)
+            return chunk_index == 0
+
     async def send(
         self,
         chat_id: str,
@@ -210,7 +263,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         
         try:
-            # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
             
@@ -218,31 +270,30 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = metadata.get("thread_id") if metadata else None
             
             for i, chunk in enumerate(chunks):
-                # Try Markdown first, fall back to plain text if it fails
+                should_thread = self._should_thread_reply(reply_to, i)
+                reply_to_id = int(reply_to) if should_thread else None
+                
                 try:
                     msg = await self._bot.send_message(
                         chat_id=int(chat_id),
                         text=chunk,
                         parse_mode=ParseMode.MARKDOWN_V2,
-                        reply_to_message_id=int(reply_to) if reply_to and i == 0 else None,
+                        reply_to_message_id=reply_to_id,
                         message_thread_id=int(thread_id) if thread_id else None,
                     )
                 except Exception as md_error:
-                    # Markdown parsing failed, try plain text
                     if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                         logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                        # Strip MDV2 escape backslashes so the user doesn't
-                        # see raw backslashes littered through the message.
                         plain_chunk = _strip_mdv2(chunk)
                         msg = await self._bot.send_message(
                             chat_id=int(chat_id),
                             text=plain_chunk,
-                            parse_mode=None,  # Plain text
-                            reply_to_message_id=int(reply_to) if reply_to and i == 0 else None,
+                            parse_mode=None,
+                            reply_to_message_id=reply_to_id,
                             message_thread_id=int(thread_id) if thread_id else None,
                         )
                     else:
-                        raise  # Re-raise if not a parse error
+                        raise
                 message_ids.append(str(msg.message_id))
             
             return SendResult(
@@ -252,6 +303,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             
         except Exception as e:
+            logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
     async def edit_message(
@@ -281,7 +333,242 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
+            logger.error(
+                "[%s] Failed to edit Telegram message %s: %s",
+                self.name,
+                message_id,
+                e,
+                exc_info=True,
+            )
             return SendResult(success=False, error=str(e))
+
+    async def stream_start(
+        self,
+        chat_id: str,
+        initial_text: str = "",
+        thread_id: Optional[int] = None,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """
+        Start a streaming message for real-time updates.
+        
+        The message will be created and can be updated via stream_update().
+        Use stream_end() to finalize.
+        
+        Args:
+            chat_id: Target chat ID
+            initial_text: Optional initial text (min 30 chars for push notification quality)
+            thread_id: Thread/topic ID for forum messages
+            lane: Stream lane (ANSWER or REASONING)
+            
+        Returns:
+            SendResult with stream_key in raw_response
+        """
+        if not self._streaming_manager or not self.streaming_enabled_for(int(chat_id)):
+            # Fallback to regular send if streaming disabled
+            if initial_text:
+                return await self.send(chat_id, initial_text, metadata={"thread_id": thread_id})
+            return SendResult(success=False, error="Streaming not enabled")
+        
+        try:
+            stream_key = await self._streaming_manager.start_stream(
+                chat_id=int(chat_id),
+                thread_id=thread_id,
+                lane=lane,
+                initial_min_chars=0,
+            )
+            
+            if initial_text:
+                await self._streaming_manager.update_stream(int(chat_id), initial_text, lane)
+                # Materialize the initial preview immediately so the stream has
+                # a message_id before cancellation/cleanup races with the first
+                # tool log update.
+                await self._streaming_manager.flush_stream(int(chat_id), lane)
+                
+            return SendResult(
+                success=True,
+                raw_response={"stream_key": stream_key, "lane": lane.value}
+            )
+        except Exception as e:
+            logger.error("[%s] Failed to start stream: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def stream_update(
+        self,
+        chat_id: str,
+        text: str,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """
+        Update a streaming message with new text.
+        
+        The update is debounced - it may not send immediately to avoid
+        hitting Telegram's rate limits. The text accumulates until
+        the throttle interval passes.
+        
+        Args:
+            chat_id: Target chat ID
+            text: Current full text to display
+            lane: Stream lane to update
+            
+        Returns:
+            SendResult indicating if update was queued
+        """
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+        
+        try:
+            await self._streaming_manager.update_stream(int(chat_id), text, lane)
+            return SendResult(success=True)
+        except Exception as e:
+            logger.error("[%s] Failed to update stream: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def stream_flush(
+        self,
+        chat_id: str,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """Force an immediate flush of the pending stream text to Telegram."""
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+        try:
+            await self._streaming_manager.flush_stream(int(chat_id), lane)
+            return SendResult(success=True)
+        except Exception as e:
+            return SendResult(success=False, error=str(e))
+
+    async def stream_end(
+        self,
+        chat_id: str,
+        final_text: Optional[str] = None,
+        lane: StreamLane = StreamLane.ANSWER,
+    ) -> SendResult:
+        """
+        Finalize a streaming message.
+        
+        Flushes any pending text and stops the stream. The message
+        remains in the chat as a regular message.
+        
+        Args:
+            chat_id: Target chat ID
+            final_text: Optional final text (if different from last update)
+            lane: Stream lane to end
+            
+        Returns:
+            SendResult with the final message_id
+        """
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+        
+        try:
+            # Send final update if provided
+            if final_text:
+                await self._streaming_manager.update_stream(int(chat_id), final_text, lane)
+            
+            # Flush and stop
+            await self._streaming_manager.flush_stream(int(chat_id), lane)
+            message_id = self._streaming_manager.get_stream_message_id(int(chat_id), lane)
+            await self._streaming_manager.stop_stream(int(chat_id), lane)
+            
+            return SendResult(
+                success=True,
+                message_id=str(message_id) if message_id else None,
+            )
+        except Exception as e:
+            logger.error("[%s] Failed to end stream: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def stream_delete(
+        self,
+        chat_id: str,
+        lane: StreamLane = StreamLane.ANSWER,
+        *,
+        deferred: bool = False,
+    ) -> SendResult:
+        """
+        Discard the streaming preview and optionally delete the message.
+
+        Args:
+            chat_id: Target chat ID.
+            lane: Stream lane to delete.
+            deferred: If True, only discard the stream and return the
+                message_id (caller is responsible for deleting later).
+                If False, delete the message immediately.
+        """
+        if not self._streaming_manager:
+            return SendResult(success=False, error="No active stream")
+
+        try:
+            message_id = await self._streaming_manager.discard_stream(int(chat_id), lane)
+
+            if not deferred and message_id and self._bot:
+                await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
+                logger.debug("[%s] Deleted stream preview %s", self.name, message_id)
+
+            return SendResult(
+                success=True,
+                message_id=str(message_id) if message_id else None,
+            )
+        except Exception as e:
+            logger.debug("[%s] Failed to delete stream preview: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    async def delete_message(self, chat_id: str, message_id: int) -> None:
+        """Delete a message by ID."""
+        if self._bot:
+            await self._bot.delete_message(chat_id=int(chat_id), message_id=message_id)
+
+    def streaming_enabled_for(self, chat_id: int) -> bool:
+        """Check if streaming is enabled for a specific chat (any mode)."""
+        if not self._streaming_manager:
+            return False
+        if self._streaming_enabled:
+            return True
+        if self.reasoning_mode_for(chat_id) == "stream":
+            return True
+        return self._streaming_chat_modes.get(chat_id, "off") != "off"
+
+    def streaming_mode_for(self, chat_id: int) -> str:
+        """Return streaming mode for a chat: 'off', 'on', or 'detailed'."""
+        if self._streaming_enabled:
+            return "detailed"
+        return self._streaming_chat_modes.get(chat_id, "off")
+
+    @property
+    def streaming_enabled(self) -> bool:
+        """Check if streaming is enabled globally."""
+        return self._streaming_enabled and self._streaming_manager is not None
+
+    def set_streaming_mode(self, chat_id: int, mode: str) -> str:
+        """Set streaming mode for a chat. Returns the mode that was set."""
+        if mode == "off":
+            self._streaming_chat_modes.pop(chat_id, None)
+        else:
+            self._streaming_chat_modes[chat_id] = mode
+        return mode
+
+    def toggle_streaming(self, chat_id: int) -> bool:
+        """Toggle streaming for a chat. Returns new state. (Legacy compat)"""
+        current = self._streaming_chat_modes.get(chat_id, "off")
+        if current != "off":
+            self._streaming_chat_modes.pop(chat_id, None)
+            return False
+        else:
+            self._streaming_chat_modes[chat_id] = "on"
+            return True
+
+    def reasoning_mode_for(self, chat_id: int) -> str:
+        """Return reasoning mode for a chat: 'off', 'on', or 'stream'."""
+        return self._reasoning_chat_modes.get(chat_id, "off")
+
+    def set_reasoning_mode(self, chat_id: int, mode: str) -> str:
+        """Set reasoning mode for a chat. Returns the mode that was set."""
+        if mode == "off":
+            self._reasoning_chat_modes.pop(chat_id, None)
+        else:
+            self._reasoning_chat_modes[chat_id] = mode
+        return mode
 
     async def send_voice(
         self,
@@ -323,7 +610,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send voice/audio: {e}")
+            logger.error(
+                "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             return await super().send_voice(chat_id, audio_path, caption, reply_to)
     
     async def send_image_file(
@@ -332,6 +624,7 @@ class TelegramAdapter(BasePlatformAdapter):
         image_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
         """Send a local image file natively as a Telegram photo."""
         if not self._bot:
@@ -351,8 +644,73 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send local image: {e}")
+            logger.error(
+                "[%s] Failed to send Telegram local image, falling back to base adapter: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             return await super().send_image_file(chat_id, image_path, caption, reply_to)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a document/file natively as a Telegram file attachment."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            if not os.path.exists(file_path):
+                return SendResult(success=False, error=f"File not found: {file_path}")
+
+            display_name = file_name or os.path.basename(file_path)
+
+            with open(file_path, "rb") as f:
+                msg = await self._bot.send_document(
+                    chat_id=int(chat_id),
+                    document=f,
+                    filename=display_name,
+                    caption=caption[:1024] if caption else None,
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            print(f"[{self.name}] Failed to send document: {e}")
+            return await super().send_document(chat_id, file_path, caption, file_name, reply_to)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a video natively as a Telegram video message."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            if not os.path.exists(video_path):
+                return SendResult(success=False, error=f"Video file not found: {video_path}")
+
+            with open(video_path, "rb") as f:
+                msg = await self._bot.send_video(
+                    chat_id=int(chat_id),
+                    video=f,
+                    caption=caption[:1024] if caption else None,
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            print(f"[{self.name}] Failed to send video: {e}")
+            return await super().send_video(chat_id, video_path, caption, reply_to)
 
     async def send_image(
         self,
@@ -382,7 +740,12 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            logger.warning("[%s] URL-based send_photo failed (%s), trying file upload", self.name, e)
+            logger.warning(
+                "[%s] URL-based send_photo failed, trying file upload: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             # Fallback: download and upload as file (supports up to 10MB)
             try:
                 import httpx
@@ -399,7 +762,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
             except Exception as e2:
-                logger.error("[%s] File upload send_photo also failed: %s", self.name, e2)
+                logger.error(
+                    "[%s] File upload send_photo also failed: %s",
+                    self.name,
+                    e2,
+                    exc_info=True,
+                )
                 # Final fallback: send URL as text
                 return await super().send_image(chat_id, image_url, caption, reply_to)
     
@@ -426,7 +794,12 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
-            print(f"[{self.name}] Failed to send animation, falling back to photo: {e}")
+            logger.error(
+                "[%s] Failed to send Telegram animation, falling back to photo: %s",
+                self.name,
+                e,
+                exc_info=True,
+            )
             # Fallback: try as a regular photo
             return await self.send_image(chat_id, animation_url, caption, reply_to)
 
@@ -440,8 +813,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     action="typing",
                     message_thread_id=int(_typing_thread) if _typing_thread else None,
                 )
-            except Exception:
-                pass  # Ignore typing indicator failures
+            except Exception as e:
+                # Typing failures are non-fatal; log at debug level only.
+                logger.debug(
+                    "[%s] Failed to send Telegram typing indicator: %s",
+                    self.name,
+                    e,
+                    exc_info=True,
+                )
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Telegram chat."""
@@ -468,6 +847,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 "is_forum": getattr(chat, "is_forum", False),
             }
         except Exception as e:
+            logger.error(
+                "[%s] Failed to get Telegram chat info for %s: %s",
+                self.name,
+                chat_id,
+                e,
+                exc_info=True,
+            )
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
     
     def format_message(self, content: str) -> str:
@@ -566,6 +952,39 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
     
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+
+        if query.data.startswith("streaming:"):
+            mode = query.data.split(":", 1)[1]
+            chat_id = query.message.chat_id
+            self.set_streaming_mode(chat_id, mode)
+            labels = {"off": "⏹ Streaming disabled.", "on": "✅ Streaming: on — tool logs.", "detailed": "✅ Streaming: detailed — tool logs + live answer."}
+            await query.edit_message_text(labels.get(mode, f"Streaming set to {mode}."))
+        elif query.data.startswith("reasoning:"):
+            mode = query.data.split(":", 1)[1]
+            event = self._build_message_event(query.message, MessageType.COMMAND)
+            event.text = f"/reasoning {mode}"
+            response_text = None
+            if self._message_handler:
+                try:
+                    response_text = await self._message_handler(event)
+                except Exception:
+                    logger.exception("[%s] Failed to process reasoning callback", self.name)
+            if not response_text:
+                self.set_reasoning_mode(query.message.chat_id, mode)
+                fallback_labels = {
+                    "off": "Reasoning hidden for this chat.",
+                    "on": "Reasoning will be shown after the reply completes.",
+                    "stream": "Reasoning will stream live for this chat.",
+                }
+                response_text = fallback_labels.get(mode, f"Reasoning set to {mode}.")
+            await query.edit_message_text(response_text)
+
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:
@@ -656,9 +1075,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
                 event.media_urls = [cached_path]
                 event.media_types = [f"image/{ext.lstrip('.')}"]
-                print(f"[Telegram] Cached user photo: {cached_path}", flush=True)
+                logger.info("[Telegram] Cached user photo at %s", cached_path)
             except Exception as e:
-                print(f"[Telegram] Failed to cache photo: {e}", flush=True)
+                logger.warning("[Telegram] Failed to cache photo: %s", e, exc_info=True)
         
         # Download voice/audio messages to cache for STT transcription
         if msg.voice:
@@ -668,9 +1087,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/ogg"]
-                print(f"[Telegram] Cached user voice: {cached_path}", flush=True)
+                logger.info("[Telegram] Cached user voice at %s", cached_path)
             except Exception as e:
-                print(f"[Telegram] Failed to cache voice: {e}", flush=True)
+                logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
         elif msg.audio:
             try:
                 file_obj = await msg.audio.get_file()
@@ -678,9 +1097,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/mp3"]
-                print(f"[Telegram] Cached user audio: {cached_path}", flush=True)
+                logger.info("[Telegram] Cached user audio at %s", cached_path)
             except Exception as e:
-                print(f"[Telegram] Failed to cache audio: {e}", flush=True)
+                logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
 
         # Download document files to cache for agent processing
         elif msg.document:
@@ -705,7 +1124,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Unsupported document type '{ext or 'unknown'}'. "
                         f"Supported types: {supported_list}"
                     )
-                    print(f"[Telegram] Unsupported document type: {ext or 'unknown'}", flush=True)
+                    logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
                     await self.handle_message(event)
                     return
 
@@ -716,7 +1135,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "The document is too large or its size could not be verified. "
                         "Maximum: 20 MB."
                     )
-                    print(f"[Telegram] Document too large: {doc.file_size} bytes", flush=True)
+                    logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
                     await self.handle_message(event)
                     return
 
@@ -728,7 +1147,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
                 event.media_urls = [cached_path]
                 event.media_types = [mime_type]
-                print(f"[Telegram] Cached user document: {cached_path}", flush=True)
+                logger.info("[Telegram] Cached user document at %s", cached_path)
 
                 # For text files, inject content into event.text (capped at 100 KB)
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
@@ -743,10 +1162,13 @@ class TelegramAdapter(BasePlatformAdapter):
                         else:
                             event.text = injection
                     except UnicodeDecodeError:
-                        print(f"[Telegram] Could not decode text file as UTF-8, skipping content injection", flush=True)
+                        logger.warning(
+                            "[Telegram] Could not decode text file as UTF-8, skipping content injection",
+                            exc_info=True,
+                        )
 
             except Exception as e:
-                print(f"[Telegram] Failed to cache document: {e}", flush=True)
+                logger.warning("[Telegram] Failed to cache document: %s", e, exc_info=True)
 
         await self.handle_message(event)
     
@@ -781,7 +1203,7 @@ class TelegramAdapter(BasePlatformAdapter):
             event.text = build_sticker_injection(
                 cached["description"], cached.get("emoji", emoji), cached.get("set_name", set_name)
             )
-            print(f"[Telegram] Sticker cache hit: {sticker.file_unique_id}", flush=True)
+            logger.info("[Telegram] Sticker cache hit: %s", sticker.file_unique_id)
             return
 
         # Cache miss -- download and analyze
@@ -789,7 +1211,7 @@ class TelegramAdapter(BasePlatformAdapter):
             file_obj = await sticker.get_file()
             image_bytes = await file_obj.download_as_bytearray()
             cached_path = cache_image_from_bytes(bytes(image_bytes), ext=".webp")
-            print(f"[Telegram] Analyzing sticker: {cached_path}", flush=True)
+            logger.info("[Telegram] Analyzing sticker at %s", cached_path)
 
             from tools.vision_tools import vision_analyze_tool
             import json as _json
@@ -811,7 +1233,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     emoji, set_name,
                 )
         except Exception as e:
-            print(f"[Telegram] Sticker analysis error: {e}", flush=True)
+            logger.warning("[Telegram] Sticker analysis error: %s", e, exc_info=True)
             event.text = build_sticker_injection(
                 f"a sticker with emoji {emoji}" if emoji else "a sticker",
                 emoji, set_name,
