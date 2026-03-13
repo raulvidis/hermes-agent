@@ -94,6 +94,29 @@ def _strip_mdv2(text: str) -> str:
     return cleaned
 
 
+def _format_reasoning_preview_mdv2(content: str) -> str:
+    """Format the transient reasoning preview as safe MarkdownV2."""
+    prefix = "💭 **Reasoning**"
+    if not content.startswith(prefix):
+        return content
+
+    body = content[len(prefix):].lstrip("\n")
+    escaped_lines = []
+    for line in body.splitlines():
+        if line.strip():
+            inner = line.strip()
+            if inner.startswith("*") and inner.endswith("*") and len(inner) >= 2:
+                inner = inner[1:-1]
+            escaped_lines.append(f"_{_escape_mdv2(inner)}_")
+        else:
+            escaped_lines.append("")
+
+    escaped_body = "\n".join(escaped_lines).strip()
+    if not escaped_body:
+        return "💭 *Reasoning*"
+    return f"💭 *Reasoning*\n\n{escaped_body}"
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -502,6 +525,9 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return content
+
+        if content.startswith("💭 **Reasoning**"):
+            return _format_reasoning_preview_mdv2(content)
 
         placeholders: dict = {}
         counter = [0]
