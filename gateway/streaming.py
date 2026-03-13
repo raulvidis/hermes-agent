@@ -175,6 +175,7 @@ class TelegramDraftStream:
             return None
 
         formatted = self._format_text(text)
+        logger.debug("stream _send_update: len=%d msg_id=%s draft=%s", len(text), self._state.message_id, self.using_draft_transport)
 
         # Try draft transport first (typing bubble effect in DMs)
         if self.using_draft_transport:

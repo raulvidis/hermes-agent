@@ -2939,7 +2939,15 @@ class GatewayRunner:
         )
         tool_progress_enabled = progress_mode != "off"
         callback_loop = asyncio.get_running_loop()
-        telegram_stream_progress = source.platform in {Platform.TELEGRAM, Platform.TELEGRAM.value}
+        # Route tool progress to the streaming preview (merged with answer text)
+        # only when streaming is actually enabled for this chat.
+        _tg_adapter = self.adapters.get(source.platform)
+        telegram_stream_progress = False
+        if _tg_adapter and hasattr(_tg_adapter, 'streaming_enabled_for'):
+            try:
+                telegram_stream_progress = _tg_adapter.streaming_enabled_for(int(source.chat_id))
+            except (ValueError, TypeError):
+                pass
 
         progress_queue: Optional[asyncio.Queue[str]] = asyncio.Queue() if tool_progress_enabled else None
         streaming_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
@@ -3052,6 +3060,7 @@ class GatewayRunner:
                     streaming_on = adapter.streaming_enabled_for(int(source.chat_id))
                 else:
                     streaming_on = getattr(adapter, 'streaming_enabled', False)
+            logger.debug("send_streaming_updates: streaming_on=%s for chat %s", streaming_on, source.chat_id)
             if not streaming_on:
                 return
 
