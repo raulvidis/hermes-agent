@@ -758,11 +758,13 @@ class BasePlatformAdapter(ABC):
                     # response has been sent (the user sees the real message).
                     _chat_id = event.source.chat_id
                     preview_ids = self._pending_preview_deletes.pop(_chat_id, [])
+                    print(f"[STREAM-DBG] post-send delete: chat={_chat_id} preview_ids={preview_ids}")
                     for mid in preview_ids:
                         try:
                             await self.delete_message(chat_id=_chat_id, message_id=mid)
+                            print(f"[STREAM-DBG] deleted preview msg {mid}")
                         except Exception as e:
-                            logger.debug("Preview delete failed (msg %s): %s", mid, e)
+                            print(f"[STREAM-DBG] delete failed msg {mid}: {e}")
                 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()

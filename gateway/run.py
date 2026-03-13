@@ -3138,6 +3138,7 @@ class GatewayRunner:
             while True:
                 try:
                     update_type, text = await asyncio.wait_for(streaming_queue.get(), timeout=0.25)
+                    print(f"[STREAM-DBG] queue got: type={update_type} len={len(text)}")
 
                     if update_type == "progress":
                         await _typewriter(text)
@@ -3152,6 +3153,7 @@ class GatewayRunner:
                             update_type, text = streaming_queue.get_nowait()
                         except asyncio.QueueEmpty:
                             break
+                        print(f"[STREAM-DBG] drain got: type={update_type} len={len(text)}")
                         if update_type == "progress":
                             await _typewriter(text)
                         elif update_type == "reasoning":
@@ -3163,6 +3165,7 @@ class GatewayRunner:
                 except asyncio.TimeoutError:
                     await _flush_latest()
                 except asyncio.CancelledError:
+                    print(f"[STREAM-DBG] CancelledError! stream_started={stream_started}")
                     # Discard stream without flushing or deleting yet.
                     # Stash message IDs so they can be deleted AFTER the
                     # final response is sent (avoids visual flash).
@@ -3172,10 +3175,11 @@ class GatewayRunner:
                                 chat_id=source.chat_id, lane=StreamLane.ANSWER,
                                 deferred=True,
                             )
+                            print(f"[STREAM-DBG] stream_delete: success={result.success} msg_id={result.message_id}")
                             if result.success and result.message_id:
                                 _preview_msg_ids_to_delete.append(int(result.message_id))
                         except Exception as e:
-                            logger.debug("Stream discard error: %s", e)
+                            print(f"[STREAM-DBG] stream_delete error: {e}")
                     return
                 except Exception as e:
                     logger.debug("Streaming update error: %s", e)
@@ -3559,8 +3563,10 @@ class GatewayRunner:
 
         # Update preview IDs AFTER streaming task has been cancelled and awaited,
         # because the CancelledError handler populates _preview_msg_ids_to_delete.
+        print(f"[STREAM-DBG] after finally: _preview_msg_ids_to_delete={_preview_msg_ids_to_delete}")
         if isinstance(response, dict) and _preview_msg_ids_to_delete:
             response["preview_msg_ids"] = list(_preview_msg_ids_to_delete)
+        print(f"[STREAM-DBG] response preview_msg_ids={response.get('preview_msg_ids', []) if isinstance(response, dict) else 'N/A'}")
 
         return response
 
