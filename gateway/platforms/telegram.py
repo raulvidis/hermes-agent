@@ -358,7 +358,7 @@ class TelegramAdapter(BasePlatformAdapter):
         Returns:
             SendResult with stream_key in raw_response
         """
-        if not self._streaming_manager or not self._streaming_enabled:
+        if not self._streaming_manager or not self.streaming_enabled_for(int(chat_id)):
             # Fallback to regular send if streaming disabled
             if initial_text:
                 return await self.send(chat_id, initial_text, metadata={"thread_id": thread_id})
