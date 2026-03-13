@@ -731,6 +731,14 @@ class BasePlatformAdapter(ABC):
                     _metadata["thread_id"] = event.source.thread_id
                 _send_meta = _metadata or None
 
+                async def _delete_preview_messages() -> None:
+                    preview_ids = self._pending_preview_deletes.pop(event.source.chat_id, [])
+                    for mid in preview_ids:
+                        try:
+                            await self.delete_message(chat_id=event.source.chat_id, message_id=mid)
+                        except Exception as e:
+                            logger.debug("[%s] Preview delete failed for %s: %s", self.name, mid, e)
+
                 # Send the text portion first (if any remains after extractions)
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
@@ -754,18 +762,6 @@ class BasePlatformAdapter(ABC):
                         if not fallback_result.success:
                             print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
 
-                    # Delete streaming preview messages now that the final
-                    # response has been sent (the user sees the real message).
-                    _chat_id = event.source.chat_id
-                    preview_ids = self._pending_preview_deletes.pop(_chat_id, [])
-                    print(f"[STREAM-DBG] post-send delete: chat={_chat_id} preview_ids={preview_ids}")
-                    for mid in preview_ids:
-                        try:
-                            await self.delete_message(chat_id=_chat_id, message_id=mid)
-                            print(f"[STREAM-DBG] deleted preview msg {mid}")
-                        except Exception as e:
-                            print(f"[STREAM-DBG] delete failed msg {mid}: {e}")
-                
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
                 
@@ -836,6 +832,8 @@ class BasePlatformAdapter(ABC):
                             print(f"[{self.name}] Failed to send media ({ext}): {media_result.error}")
                     except Exception as media_err:
                         print(f"[{self.name}] Error sending media: {media_err}")
+
+                await _delete_preview_messages()
             
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:

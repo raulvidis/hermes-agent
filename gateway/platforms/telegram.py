@@ -377,6 +377,10 @@ class TelegramAdapter(BasePlatformAdapter):
             
             if initial_text:
                 await self._streaming_manager.update_stream(int(chat_id), initial_text, lane)
+                # Materialize the initial preview immediately so the stream has
+                # a message_id before cancellation/cleanup races with the first
+                # tool log update.
+                await self._streaming_manager.flush_stream(int(chat_id), lane)
                 
             return SendResult(
                 success=True,

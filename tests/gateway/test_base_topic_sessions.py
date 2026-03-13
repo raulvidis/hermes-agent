@@ -15,6 +15,7 @@ class DummyTelegramAdapter(BasePlatformAdapter):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
         self.sent = []
         self.typing = []
+        self.deleted = []
 
     async def connect(self) -> bool:
         return True
@@ -36,6 +37,9 @@ class DummyTelegramAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         self.typing.append({"chat_id": chat_id, "metadata": metadata})
         return None
+
+    async def delete_message(self, chat_id: str, message_id: int) -> None:
+        self.deleted.append({"chat_id": chat_id, "message_id": message_id})
 
     async def get_chat_info(self, chat_id: str):
         return {"id": chat_id}
@@ -133,3 +137,28 @@ class TestBasePlatformTopicSessions:
                 "metadata": {"thread_id": "17585"},
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_deletes_preview_for_media_only_reply(self):
+        adapter = DummyTelegramAdapter()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return "![img](https://example.com/result.png)"
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        async def send_image(chat_id, image_url, caption=None, metadata=None):
+            return SendResult(success=True, message_id="img-1")
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+        adapter.send_image = send_image
+        adapter._pending_preview_deletes["-1001"] = [321]
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == []
+        assert adapter.deleted == [{"chat_id": "-1001", "message_id": 321}]

@@ -2230,12 +2230,29 @@ class AIAgent:
         for attempt in range(max_stream_retries + 1):
             try:
                 with self.client.responses.stream(**api_kwargs) as stream:
+                    answer_so_far = ""
+                    reasoning_so_far = ""
                     for event in stream:
-                        # Emit text deltas via streaming callback
-                        if self.streaming_callback and hasattr(event, 'type'):
-                            if event.type == 'response.output_text.delta':
+                        if not hasattr(event, "type"):
+                            continue
+                        if event.type == "response.output_text.delta":
+                            delta = getattr(event, "delta", "") or ""
+                            if not delta:
+                                continue
+                            answer_so_far += delta
+                            if self.streaming_callback:
                                 try:
-                                    self.streaming_callback(getattr(event, 'delta', ''))
+                                    self.streaming_callback(answer_so_far)
+                                except Exception:
+                                    pass
+                        elif event.type == "response.reasoning_summary_text.delta":
+                            delta = getattr(event, "delta", "") or ""
+                            if not delta:
+                                continue
+                            reasoning_so_far += delta
+                            if self.reasoning_callback:
+                                try:
+                                    self.reasoning_callback(reasoning_so_far)
                                 except Exception:
                                     pass
                     return stream.get_final_response()

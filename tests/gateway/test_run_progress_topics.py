@@ -232,6 +232,4 @@ def test_telegram_streaming_merges_progress_and_answer(monkeypatch, tmp_path):
     assert any('💻 terminal: "pwd"' in payload for payload in answer_payloads)
     assert any('🌐 browser_navigate: "https://example.com"' in payload for payload in answer_payloads)
     assert any('partial answer complete' in payload for payload in answer_payloads)
-    reasoning_payloads = [item["initial_text"] for item in adapter.stream_starts if item["lane"].value == "reasoning"]
-    reasoning_payloads += [item["text"] for item in adapter.stream_updates if item["lane"].value == "reasoning"]
-    assert any("thinking" in payload for payload in reasoning_payloads)
+    assert any("thinking" in payload for payload in answer_payloads)

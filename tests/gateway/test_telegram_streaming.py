@@ -74,6 +74,39 @@ def test_discard_stream_returns_message_id_without_flushing():
         assert "should not be sent" not in text
 
 
+def test_stream_start_materializes_initial_preview_for_cleanup():
+    """stream_start should flush initial_text so cleanup can recover message_id."""
+    from gateway.config import PlatformConfig
+    from gateway.platforms.telegram import TelegramAdapter
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=404))
+
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake", streaming_enabled=True))
+    adapter._bot = bot
+    adapter._streaming_manager = StreamingManager(adapter, throttle_ms=10)
+
+    async def _run():
+        result = await adapter.stream_start(
+            chat_id="123",
+            initial_text='Running:\n💻 terminal: "pwd"',
+            lane=StreamLane.ANSWER,
+        )
+        delete_result = await adapter.stream_delete(
+            chat_id="123",
+            lane=StreamLane.ANSWER,
+            deferred=True,
+        )
+        return result, delete_result
+
+    result, delete_result = asyncio.run(_run())
+
+    assert result.success is True
+    bot.send_message.assert_awaited_once()
+    assert delete_result.success is True
+    assert delete_result.message_id == "404"
+
+
 def test_draft_transport_calls_do_api_request():
     """Draft transport should call do_api_request with sendMessageDraft."""
     bot = AsyncMock()
