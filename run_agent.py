@@ -173,6 +173,7 @@ class AIAgent:
         session_id: str = None,
         tool_progress_callback: callable = None,
         thinking_callback: callable = None,
+        reasoning_callback: callable = None,
         clarify_callback: callable = None,
         step_callback: callable = None,
         max_tokens: int = None,
@@ -260,6 +261,7 @@ class AIAgent:
 
         self.tool_progress_callback = tool_progress_callback
         self.thinking_callback = thinking_callback
+        self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
         self._last_reported_tool = None  # Track for "new tool" mode
@@ -779,6 +781,17 @@ class AIAgent:
             return "\n\n".join(reasoning_parts)
         
         return None
+
+    def _merge_stream_reasoning(self, current: str, delta_obj: Any) -> str:
+        """Merge streaming reasoning content from incremental provider deltas."""
+        chunk = self._extract_reasoning(delta_obj)
+        if not chunk:
+            return current
+        if not current:
+            return chunk
+        if chunk.startswith(current) or current.endswith(chunk):
+            return max(current, chunk, key=len)
+        return current + chunk
     
     def _cleanup_task_resources(self, task_id: str) -> None:
         """Clean up VM and browser resources for a given task."""
@@ -2017,9 +2030,20 @@ class AIAgent:
         max_stream_retries = 1
         for attempt in range(max_stream_retries + 1):
             try:
+                reasoning_so_far = ""
                 with self.client.responses.stream(**api_kwargs) as stream:
-                    for _ in stream:
-                        pass
+                    for event in stream:
+                        event_type = getattr(event, "type", None)
+                        delta = getattr(event, "delta", None)
+                        if event_type == "response.reasoning_summary_text.delta" and delta and self.reasoning_callback:
+                            if delta.startswith(reasoning_so_far):
+                                reasoning_so_far = delta
+                            else:
+                                reasoning_so_far += delta
+                            try:
+                                self.reasoning_callback(reasoning_so_far)
+                            except Exception:
+                                pass
                     return stream.get_final_response()
             except RuntimeError as exc:
                 err_text = str(exc)
@@ -2052,11 +2076,25 @@ class AIAgent:
             return stream_or_response
 
         terminal_response = None
+        reasoning_so_far = ""
         try:
             for event in stream_or_response:
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
+                delta = getattr(event, "delta", None)
+                if delta is None and isinstance(event, dict):
+                    delta = event.get("delta")
+                if event_type == "response.reasoning_summary_text.delta" and delta and self.reasoning_callback:
+                    if isinstance(delta, str):
+                        if delta.startswith(reasoning_so_far):
+                            reasoning_so_far = delta
+                        else:
+                            reasoning_so_far += delta
+                        try:
+                            self.reasoning_callback(reasoning_so_far)
+                        except Exception:
+                            pass
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                     continue
 
@@ -2172,6 +2210,8 @@ class AIAgent:
             try:
                 if self.api_mode == "codex_responses":
                     result["response"] = self._run_codex_stream(api_kwargs)
+                elif self.reasoning_callback:
+                    result["response"] = self._run_streaming_chat_completion(api_kwargs)
                 else:
                     result["response"] = self.client.chat.completions.create(**api_kwargs)
             except Exception as e:
@@ -2196,6 +2236,83 @@ class AIAgent:
         if result["error"] is not None:
             raise result["error"]
         return result["response"]
+
+    def _run_streaming_chat_completion(self, api_kwargs: dict):
+        """Stream chat completions to surface reasoning deltas without answer streaming."""
+        from types import SimpleNamespace
+
+        stream_kwargs = dict(api_kwargs)
+        stream_kwargs["stream"] = True
+        stream_kwargs["stream_options"] = {"include_usage": True}
+
+        accumulated_content: list[str] = []
+        reasoning_so_far = ""
+        accumulated_tool_calls: dict[int, dict] = {}
+        final_usage = None
+
+        try:
+            stream = self.client.chat.completions.create(**stream_kwargs)
+            for chunk in stream:
+                if not chunk.choices:
+                    if chunk.usage:
+                        final_usage = chunk.usage
+                    continue
+
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    accumulated_content.append(delta.content)
+
+                reasoning_so_far = self._merge_stream_reasoning(reasoning_so_far, delta)
+                if reasoning_so_far and self.reasoning_callback:
+                    try:
+                        self.reasoning_callback(reasoning_so_far)
+                    except Exception:
+                        pass
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in accumulated_tool_calls:
+                            accumulated_tool_calls[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                accumulated_tool_calls[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                accumulated_tool_calls[idx]["arguments"] += tc_delta.function.arguments
+
+            tool_calls = []
+            for idx in sorted(accumulated_tool_calls):
+                tc = accumulated_tool_calls[idx]
+                if tc["name"]:
+                    tool_calls.append(
+                        SimpleNamespace(
+                            id=tc["id"],
+                            type="function",
+                            function=SimpleNamespace(name=tc["name"], arguments=tc["arguments"]),
+                        )
+                    )
+
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="".join(accumulated_content) or "",
+                            tool_calls=tool_calls or None,
+                            role="assistant",
+                        ),
+                        finish_reason="tool_calls" if tool_calls else "stop",
+                    )
+                ],
+                usage=final_usage,
+                model=self.model,
+            )
+        except Exception as e:
+            logger.debug("Reasoning stream failed, falling back to non-streaming chat completion: %s", e)
+            return self.client.chat.completions.create(**api_kwargs)
 
     # ── Provider fallback ──────────────────────────────────────────────────
 
@@ -4430,9 +4547,16 @@ class AIAgent:
         if final_response and not interrupted:
             self._honcho_sync(original_user_message, final_response)
 
+        last_reasoning = None
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and msg.get("reasoning"):
+                last_reasoning = msg["reasoning"]
+                break
+
         # Build result with interrupt info if applicable
         result = {
             "final_response": final_response,
+            "last_reasoning": last_reasoning,
             "messages": messages,
             "api_calls": api_call_count,
             "completed": completed,

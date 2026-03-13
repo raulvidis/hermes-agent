@@ -16,9 +16,10 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
         Application,
+        CallbackQueryHandler,
         CommandHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
@@ -32,6 +33,7 @@ except ImportError:
     Bot = Any
     Message = Any
     Application = Any
+    CallbackQueryHandler = Any
     CommandHandler = Any
     TelegramMessageHandler = Any
     filters = None
@@ -143,6 +145,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             
             # Start polling in background
             await self._app.initialize()
@@ -170,6 +173,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommand("insights", "Show usage insights and analytics"),
                     BotCommand("update", "Update Hermes to the latest version"),
                     BotCommand("reload_mcp", "Reload MCP servers from config"),
+                    BotCommand("reasoning", "Control reasoning visibility"),
                     BotCommand("help", "Show available commands"),
                 ])
             except Exception as e:
@@ -562,9 +566,57 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
             return
+
+        if update.message.text.strip().lower() == "/reasoning":
+            if not self._bot:
+                return
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Off", callback_data="reasoning:off"),
+                    InlineKeyboardButton("On", callback_data="reasoning:on"),
+                    InlineKeyboardButton("Stream", callback_data="reasoning:stream"),
+                ]
+            ])
+            await self._bot.send_message(
+                chat_id=update.message.chat_id,
+                text="Reasoning visibility for this chat:",
+                reply_markup=keyboard,
+                message_thread_id=int(update.message.message_thread_id) if getattr(update.message, "message_thread_id", None) else None,
+            )
+            return
         
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
+
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+
+        if not query.data.startswith("reasoning:"):
+            return
+
+        mode = query.data.split(":", 1)[1]
+        response_text = None
+        if self._message_handler and query.message:
+            event = self._build_message_event(query.message, MessageType.COMMAND)
+            event.text = f"/reasoning {mode}"
+            try:
+                response_text = await self._message_handler(event)
+            except Exception:
+                logger.exception("[%s] Failed to process reasoning callback", self.name)
+
+        if not response_text:
+            fallback_labels = {
+                "off": "Reasoning hidden for this chat.",
+                "on": "Reasoning will be shown after the reply completes.",
+                "stream": "Reasoning will stream live for this chat.",
+            }
+            response_text = fallback_labels.get(mode, f"Reasoning set to {mode}.")
+
+        await query.edit_message_text(response_text)
     
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""

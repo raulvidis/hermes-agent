@@ -240,6 +240,9 @@ class SessionEntry:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+
+    # Per-session reasoning visibility: "off", "on", "stream"
+    reasoning_mode: str = "off"
     
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
@@ -257,6 +260,7 @@ class SessionEntry:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
+            "reasoning_mode": self.reasoning_mode,
         }
         if self.origin:
             result["origin"] = self.origin.to_dict()
@@ -287,6 +291,7 @@ class SessionEntry:
             input_tokens=data.get("input_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
             total_tokens=data.get("total_tokens", 0),
+            reasoning_mode=data.get("reasoning_mode", "off"),
         )
 
 
@@ -570,6 +575,19 @@ class SessionStore:
                     )
                 except Exception as e:
                     logger.debug("Session DB operation failed: %s", e)
+
+    def set_reasoning_mode(self, session_key: str, mode: str) -> Optional[SessionEntry]:
+        """Persist reasoning visibility for a session."""
+        self._ensure_loaded()
+
+        if session_key not in self._entries:
+            return None
+
+        entry = self._entries[session_key]
+        entry.updated_at = datetime.now()
+        entry.reasoning_mode = mode
+        self._save()
+        return entry
     
     def reset_session(self, session_key: str) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
@@ -599,6 +617,7 @@ class SessionStore:
             display_name=old_entry.display_name,
             platform=old_entry.platform,
             chat_type=old_entry.chat_type,
+            reasoning_mode=old_entry.reasoning_mode,
         )
         
         self._entries[session_key] = new_entry
