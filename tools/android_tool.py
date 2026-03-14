@@ -546,7 +546,7 @@ try:
         registry.register(
             name=tool_name,
             toolset="android",
-            schema={"type": "function", "function": schema},
+            schema=schema,
             handler=_HANDLERS[tool_name],
             # android_setup must work without a bridge connection (it creates the connection)
             check_fn=(lambda: True) if tool_name == "android_setup" else _check_requirements,
