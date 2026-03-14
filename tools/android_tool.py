@@ -191,12 +191,33 @@ def android_press_key(key: str) -> str:
 
 def android_screenshot() -> str:
     """
-    Capture a screenshot. Returns base64-encoded PNG.
-    Use this when the accessibility tree doesn't give enough context.
+    Capture a screenshot of the Android screen.
+    Saves to a temp file and returns the path.
+    The gateway will auto-send the image to the user via MEDIA: tag.
     """
     try:
+        import base64
+        import tempfile
         data = _get("/screenshot")
-        return json.dumps(data)  # { "image": "<base64>", "width": ..., "height": ... }
+        if "error" in data:
+            return json.dumps(data)
+
+        # Extract base64 image from the nested result
+        result = data.get("data", data)
+        img_b64 = result.get("image", "")
+        if not img_b64:
+            return json.dumps({"error": "No image data returned"})
+
+        # Save to temp file
+        img_bytes = base64.b64decode(img_b64)
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", prefix="android_screenshot_", delete=False)
+        tmp.write(img_bytes)
+        tmp.close()
+
+        w = result.get("width", "?")
+        h = result.get("height", "?")
+
+        return f"Screenshot captured ({w}x{h})\nMEDIA:{tmp.name}"
     except Exception as e:
         return json.dumps({"error": str(e)})
 
