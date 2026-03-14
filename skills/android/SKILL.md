@@ -46,40 +46,51 @@ After the user taps Connect on their phone, the phone connects to this server vi
 
 **Just ask for the pairing code, call setup, and relay the instructions.**
 
-## Core Patterns
+## Available Tools
 
-### Always read before acting
-Call `android_read_screen()` before tapping. Never guess coordinates.
+You have these 14 tools. Use them by name — they are function calls.
 
-### Prefer text over coordinates
-Use `android_tap_text("Continue")` over `android_tap(x=540, y=1200)`.
+### Connectivity
+- `android_ping()` — check if phone is connected and responding
+- `android_setup(pairing_code)` — start relay and configure connection
 
-### Wait after navigation
-After opening an app or tapping a button that triggers loading:
-```
-android_wait(text="<expected element>", timeout_ms=8000)
-```
+### Reading the Screen
+- `android_read_screen(include_bounds=False)` — get the full accessibility tree as JSON. Returns every visible UI element with text, className, nodeId, clickable, etc. **Always call this before interacting.**
+- `android_screenshot()` — capture a screenshot as base64 PNG. Use when the accessibility tree doesn't show enough (canvas apps, image-heavy UIs).
+- `android_current_app()` — get the package name and activity of the foreground app.
 
-### Confirm destructive actions
-Before confirming a purchase, ride, or send — report to the user and wait for approval.
+### Opening Apps
+- `android_open_app(package)` — launch any app by package name. **This is the primary way to open apps. Do NOT try to find and tap app icons.** Example: `android_open_app("com.instagram.android")`
+- `android_get_apps()` — list all installed apps with package names. Use this if you don't know the package name.
 
-### Typing into a field
-1. `android_tap_text("<field label>")` — focus the field
-2. `android_wait(class_name="android.widget.EditText")`
-3. `android_type("<text>", clear_first=True)`
+### Tapping
+- `android_tap(x, y, node_id)` — tap by coordinates or node ID. Prefer node_id from read_screen.
+- `android_tap_text(text, exact=False)` — tap the first element matching text. **Most convenient for buttons, menu items, links.**
 
-### Navigation
-- Back: `android_press_key("back")`
-- Home: `android_press_key("home")`
-- Notifications: `android_press_key("notifications")`
-- Find package name: `android_get_apps()` then search results
+### Typing
+- `android_type(text, clear_first=False)` — type into the currently focused input field. Tap the field first.
 
-### Permission dialogs
-Look for "Allow" / "Deny" / "While using the app" after opening apps:
-`android_tap_text("Allow")`
+### Gestures
+- `android_swipe(direction, distance="medium")` — swipe up/down/left/right. Distances: short, medium, long.
+- `android_scroll(direction, node_id=None)` — scroll a specific element or the whole screen.
 
-### When accessibility tree is insufficient
-Use `android_screenshot()` for apps with canvas/custom rendering, then use coordinates.
+### Keys
+- `android_press_key(key)` — press a key. Options: `back`, `home`, `recents`, `power`, `volume_up`, `volume_down`, `enter`, `delete`, `tab`, `escape`, `search`, `notifications`
+
+### Waiting
+- `android_wait(text, class_name, timeout_ms=5000)` — poll until an element appears. Use after navigation or loading.
+
+## Rules
+
+1. **ALWAYS open apps with `android_open_app(package)`** — never try to find and tap the icon on the home screen or app drawer.
+2. **ALWAYS call `android_read_screen()` before tapping anything** — never guess what's on screen.
+3. **After any action that changes the screen** (open app, tap button, swipe), call `android_read_screen()` or `android_wait()` before the next action.
+4. **Prefer `android_tap_text("Button Text")` over coordinates** — it's more reliable.
+5. **If you don't know a package name**, call `android_get_apps()` and search the results.
+6. **Confirm destructive actions** (purchases, sends, deletions) with the user before executing.
+7. **Handle permission dialogs** — after opening an app, read_screen may show "Allow"/"Deny" dialogs. Tap "Allow" or "While using the app".
+8. **If the accessibility tree is unhelpful**, use `android_screenshot()` and then use coordinates from the image.
+9. **Go back**: `android_press_key("back")`. **Go home**: `android_press_key("home")`.
 
 ---
 
