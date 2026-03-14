@@ -202,8 +202,8 @@ async def _serve(state: _RelayState, ready: threading.Event) -> None:
 
 async def _handle_ws(request: web.Request, state: _RelayState) -> web.WebSocketResponse:
     token = request.query.get("token", "")
-    if token != state.pairing_code:
-        logger.warning("Phone WS rejected — bad token")
+    if token.upper() != state.pairing_code.upper():
+        logger.warning("Phone WS rejected — bad token (got %s)", token)
         raise web.HTTPForbidden(text="Invalid pairing code")
 
     ws = web.WebSocketResponse(heartbeat=15.0)
