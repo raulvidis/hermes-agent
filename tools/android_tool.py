@@ -253,6 +253,23 @@ def android_current_app() -> str:
         return json.dumps({"error": str(e)})
 
 
+def _get_public_ip() -> str:
+    """Detect this server's public IP address."""
+    for service in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
+        try:
+            r = requests.get(service, timeout=3)
+            if r.status_code == 200:
+                return r.text.strip()
+        except Exception:
+            continue
+    # Fallback: hostname
+    import socket
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return "<your-server-ip>"
+
+
 def android_setup(pairing_code: str) -> str:
     """
     Start the Android bridge relay and configure the pairing code.
@@ -260,7 +277,7 @@ def android_setup(pairing_code: str) -> str:
 
     The user needs to:
     1. Open the Hermes Bridge app on their phone
-    2. Enter this server's public IP/domain and the pairing code
+    2. Enter this server's public IP and the pairing code
     3. The phone connects to the relay automatically
 
     Call this when the user provides their pairing code from the Hermes Bridge app.
@@ -268,6 +285,7 @@ def android_setup(pairing_code: str) -> str:
     """
     try:
         port = _relay_port()
+        public_ip = _get_public_ip()
 
         # Save config to ~/.hermes/.env
         relay_url = f"http://localhost:{port}"
@@ -294,35 +312,35 @@ def android_setup(pairing_code: str) -> str:
             start_relay(pairing_code=pairing_code, port=port)
 
             # Check if phone is already connected
-            import time
-            time.sleep(1)  # brief wait for relay to start
+            time.sleep(1)
             phone_connected = is_phone_connected()
 
-            return json.dumps({
-                "status": "ok",
-                "message": "Relay started! " + (
-                    "Phone is already connected — ready to go!"
-                    if phone_connected else
-                    "Waiting for phone to connect. "
-                    "Tell the user to open the Hermes Bridge app, enter this server's address and the pairing code."
-                ),
-                "relay_url": relay_url,
-                "relay_port": port,
-                "pairing_code": pairing_code,
-                "phone_connected": phone_connected,
-                "setup_instructions": (
-                    "On the phone's Hermes Bridge app:\n"
-                    f"1. Enter server address: <this-server-public-ip>:{port}\n"
-                    f"2. Pairing code is already set to: {pairing_code}\n"
-                    "3. Tap Connect"
-                ),
-            })
+            server_address = f"{public_ip}:{port}"
+
+            if phone_connected:
+                return json.dumps({
+                    "status": "ok",
+                    "message": "Phone is connected and ready!",
+                    "phone_connected": True,
+                    "server_address": server_address,
+                })
+            else:
+                return json.dumps({
+                    "status": "ok",
+                    "message": "Relay is running. Now tell the user to connect their phone.",
+                    "phone_connected": False,
+                    "server_address": server_address,
+                    "user_instructions": (
+                        f"Open the Hermes Bridge app on your phone and enter:\n"
+                        f"  Server: {server_address}\n"
+                        f"  Pairing code: {pairing_code}\n"
+                        f"Then tap Connect."
+                    ),
+                })
         except ImportError:
             return json.dumps({
-                "status": "partial",
-                "message": "Config saved but android_relay module not found. The relay needs to be installed.",
-                "relay_url": relay_url,
-                "pairing_code": pairing_code,
+                "status": "error",
+                "message": "android_relay module not found. Make sure hermes-android is installed.",
             })
 
     except Exception as e:

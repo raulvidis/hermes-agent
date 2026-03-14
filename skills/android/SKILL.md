@@ -21,21 +21,30 @@ Hermes Agent (this server)  ──HTTP──>  Hermes Bridge app (Android phone)
                                         └── Authenticated via pairing code
 ```
 
-## Setup / Connecting to a Phone
+## Setup / Connecting a Phone
 
-When the user wants to connect their phone, ask them for ONE thing:
-- **Pairing code** — a 6-character code shown in the Hermes Bridge app on their phone (e.g. `K7V3NP`)
+When the user wants to connect their phone, ask for their **pairing code** — a 6-character code shown in the Hermes Bridge app (e.g. `K7V3NP`).
 
-Then call the setup tool:
+Then call:
 ```
 android_setup("<pairing_code>")
 ```
 
-This starts a relay server on this machine and waits for the phone to connect. The user then enters this server's address in the Hermes Bridge app on their phone, and the phone connects via WebSocket.
+This does two things:
+1. Starts a relay on this server (auto-detects the server's public IP)
+2. Returns the exact instructions to tell the user — the server address and pairing code to enter in their phone app
 
-**The phone connects to the server, not the other way around.** This works even when the phone is behind NAT (home WiFi) and the server is in the cloud. No port forwarding, no VPN, no USB needed.
+**Relay the `user_instructions` field from the result directly to the user.** It contains the server IP and port they need to type into the phone app.
 
-**Do NOT ask about USB, ADB, developer options, or the phone's IP address.** The user only needs the pairing code from their phone app.
+After the user taps Connect on their phone, the phone connects to this server via WebSocket. Call `android_ping()` to verify the connection is live.
+
+**Do NOT ask about:**
+- USB, ADB, or developer options
+- The phone's IP address (not needed — the phone connects to the server, not the other way around)
+- nginx, firewalls, or port forwarding
+- Any networking concepts
+
+**Just ask for the pairing code, call setup, and relay the instructions.**
 
 ## Core Patterns
 
