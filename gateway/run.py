@@ -593,6 +593,46 @@ class GatewayRunner:
         logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
         return None
 
+    def _resolve_session_reasoning_config(self, reasoning_mode: str) -> dict | None:
+        """Resolve effective provider reasoning settings for a chat session."""
+        if reasoning_mode == "off":
+            return {"enabled": False}
+
+        base = self._reasoning_config
+        if isinstance(base, dict) and base.get("enabled") is not False:
+            return dict(base)
+
+        effort = base.get("effort") if isinstance(base, dict) else None
+        if effort:
+            return {"enabled": True, "effort": effort}
+        return {"enabled": True, "effort": "medium"}
+
+    async def _delete_preview_message(
+        self,
+        adapter: BasePlatformAdapter,
+        source: SessionSource,
+        message_id: Optional[str],
+    ) -> None:
+        """Best-effort deletion for transient preview messages."""
+        if not message_id:
+            return
+        try:
+            await adapter.delete_message(
+                chat_id=source.chat_id,
+                message_id=message_id,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_reasoning_preview(text: str) -> str:
+        """Format streamed reasoning as an italicized transient preview."""
+        body = "\n".join(
+            f"*{line}*" if line.strip() else ""
+            for line in (text or "").strip().splitlines()
+        ).strip()
+        return f"💭 **Reasoning**\n\n{body}" if body else ""
+
     @staticmethod
     def _load_show_reasoning() -> bool:
         """Load show_reasoning toggle from config.yaml display section."""
@@ -1180,6 +1220,7 @@ class GatewayRunner:
                 else:
                     return f"Quick command '/{command}' has unsupported type (only 'exec' is supported)."
 
+
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
             try:
@@ -1625,24 +1666,21 @@ class GatewayRunner:
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
 
-            # Prepend reasoning/thinking if display is enabled
-            if getattr(self, "_show_reasoning", False) and response:
-                last_reasoning = agent_result.get("last_reasoning")
-                if last_reasoning:
-                    # Collapse long reasoning to keep messages readable
-                    lines = last_reasoning.strip().splitlines()
-                    if len(lines) > 15:
-                        display_reasoning = "\n".join(lines[:15])
-                        display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
-                    else:
-                        display_reasoning = last_reasoning.strip()
-                    response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
-
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
                 "response": (response or "")[:500],
             })
+
+            if False:
+                _adapter = self.adapters.get(source.platform)
+                if _adapter:
+                    _reasoning_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    await _adapter.send(
+                        source.chat_id,
+                        f"💭 **Reasoning**\n\n{last_reasoning}",
+                        metadata=_reasoning_meta,
+                    )
             
             # Check for pending process watchers (check_interval on background processes)
             try:
@@ -1801,6 +1839,7 @@ class GatewayRunner:
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ]
         
+        lines.insert(6, f"**Reasoning:** {getattr(session_entry, 'reasoning_mode', 'off')}")
         return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
@@ -1843,6 +1882,7 @@ class GatewayRunner:
             "`/update` — Update Hermes Agent to the latest version",
             "`/help` — Show this message",
         ]
+        lines.insert(16, "`/reasoning [off|on|stream]` - Control reasoning visibility")
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
@@ -2798,88 +2838,29 @@ class GatewayRunner:
                 pass
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> str:
-        """Handle /reasoning command — manage reasoning effort and display toggle.
+        """Handle /reasoning [off|on|stream] - control reasoning visibility."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+        arg = event.get_command_args().strip().lower()
 
-        Usage:
-            /reasoning              Show current effort level and display state
-            /reasoning <level>      Set reasoning effort (none, low, medium, high, xhigh)
-            /reasoning show|on      Show model reasoning in responses
-            /reasoning hide|off     Hide model reasoning from responses
-        """
-        import yaml
-
-        args = event.get_command_args().strip().lower()
-        config_path = _hermes_home / "config.yaml"
-        self._reasoning_config = self._load_reasoning_config()
-        self._show_reasoning = self._load_show_reasoning()
-
-        def _save_config_key(key_path: str, value):
-            """Save a dot-separated key to config.yaml."""
-            try:
-                user_config = {}
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
-                keys = key_path.split(".")
-                current = user_config
-                for k in keys[:-1]:
-                    if k not in current or not isinstance(current[k], dict):
-                        current[k] = {}
-                    current = current[k]
-                current[keys[-1]] = value
-                with open(config_path, "w", encoding="utf-8") as f:
-                    yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
-                return True
-            except Exception as e:
-                logger.error("Failed to save config key %s: %s", key_path, e)
-                return False
-
-        if not args:
-            # Show current state
-            rc = self._reasoning_config
-            if rc is None:
-                level = "medium (default)"
-            elif rc.get("enabled") is False:
-                level = "none (disabled)"
-            else:
-                level = rc.get("effort", "medium")
-            display_state = "on ✓" if self._show_reasoning else "off"
+        if not arg:
+            current = getattr(session_entry, "reasoning_mode", "off")
             return (
-                "🧠 **Reasoning Settings**\n\n"
-                f"**Effort:** `{level}`\n"
-                f"**Display:** {display_state}\n\n"
-                "_Usage:_ `/reasoning <none|low|medium|high|xhigh|show|hide>`"
+                f"Current reasoning mode: `{current}`.\n"
+                "Use `/reasoning off` to disable reasoning, `/reasoning on` to enable it privately, or `/reasoning stream` to show it live."
             )
 
-        # Display toggle
-        if args in ("show", "on"):
-            self._show_reasoning = True
-            _save_config_key("display.show_reasoning", True)
-            return "🧠 ✓ Reasoning display: **ON**\nModel thinking will be shown before each response."
+        if arg not in {"off", "on", "stream"}:
+            return "Usage: `/reasoning off|on|stream`"
 
-        if args in ("hide", "off"):
-            self._show_reasoning = False
-            _save_config_key("display.show_reasoning", False)
-            return "🧠 ✓ Reasoning display: **OFF**"
-
-        # Effort level change
-        effort = args.strip()
-        if effort == "none":
-            parsed = {"enabled": False}
-        elif effort in ("xhigh", "high", "medium", "low", "minimal"):
-            parsed = {"enabled": True, "effort": effort}
-        else:
-            return (
-                f"⚠️ Unknown argument: `{effort}`\n\n"
-                "**Valid levels:** none, low, minimal, medium, high, xhigh\n"
-                "**Display:** show, hide"
-            )
-
-        self._reasoning_config = parsed
-        if _save_config_key("agent.reasoning_effort", effort):
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (saved to config)\n_(takes effect on next message)_"
-        else:
-            return f"🧠 ✓ Reasoning effort set to `{effort}` (this session only)"
+        self.session_store.set_reasoning_mode(session_key, arg)
+        labels = {
+            "off": "Reasoning disabled for this chat.",
+            "on": "Reasoning enabled and hidden for this chat.",
+            "stream": "Reasoning enabled and will stream live for this chat.",
+        }
+        return labels[arg]
 
     async def _handle_compress_command(self, event: MessageEvent) -> str:
         """Handle /compress command -- manually compress conversation context."""
@@ -3891,6 +3872,74 @@ class GatewayRunner:
                 except Exception as e:
                     logger.error("Progress message error: %s", e)
                     await asyncio.sleep(1)
+
+        _reasoning_mode = getattr(self.session_store.get_or_create_session(source), "reasoning_mode", "off")
+        _reasoning_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        reasoning_queue: Optional[asyncio.Queue[str]] = asyncio.Queue() if _reasoning_mode == "stream" else None
+
+        def reasoning_callback(text: str) -> None:
+            if reasoning_queue is None:
+                return
+            try:
+                _loop_for_step.call_soon_threadsafe(reasoning_queue.put_nowait, text or "")
+            except Exception:
+                pass
+
+        async def send_reasoning_updates():
+            if reasoning_queue is None:
+                return
+
+            adapter = self.adapters.get(source.platform)
+            if not adapter:
+                return
+
+            latest_text = ""
+            reasoning_msg_id = None
+            can_edit = True
+
+            while True:
+                try:
+                    latest_text = await asyncio.wait_for(reasoning_queue.get(), timeout=0.3)
+                    while True:
+                        try:
+                            latest_text = reasoning_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+                    payload = self._format_reasoning_preview(latest_text)
+                    if not payload.strip():
+                        continue
+
+                    if can_edit and reasoning_msg_id is not None:
+                        result = await adapter.edit_message(
+                            chat_id=source.chat_id,
+                            message_id=reasoning_msg_id,
+                            content=payload,
+                        )
+                        if not result.success:
+                            can_edit = False
+                            await self._delete_preview_message(adapter, source, reasoning_msg_id)
+                            reasoning_msg_id = None
+
+                    if reasoning_msg_id is None:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content=payload,
+                            metadata=_reasoning_metadata,
+                        )
+                        if result.success and result.message_id:
+                            reasoning_msg_id = result.message_id
+
+                    await asyncio.sleep(0.3)
+                    await adapter.send_typing(source.chat_id, metadata=_reasoning_metadata)
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    await self._delete_preview_message(adapter, source, reasoning_msg_id)
+                    return
+                except Exception as e:
+                    logger.error("Reasoning message error: %s", e)
+                    await asyncio.sleep(1)
         
         # We need to share the agent instance for interrupt support
         agent_holder = [None]  # Mutable container for the agent instance
@@ -3958,6 +4007,7 @@ class GatewayRunner:
             honcho_manager, honcho_config = self._get_or_create_gateway_honcho(session_key)
             reasoning_config = self._load_reasoning_config()
             self._reasoning_config = reasoning_config
+            effective_reasoning_config = self._resolve_session_reasoning_config(_reasoning_mode)
             agent = AIAgent(
                 model=model,
                 **runtime_kwargs,
@@ -3967,7 +4017,7 @@ class GatewayRunner:
                 enabled_toolsets=enabled_toolsets,
                 ephemeral_system_prompt=combined_ephemeral or None,
                 prefill_messages=self._prefill_messages or None,
-                reasoning_config=reasoning_config,
+                reasoning_config=effective_reasoning_config,
                 providers_allowed=pr.get("only"),
                 providers_ignored=pr.get("ignore"),
                 providers_order=pr.get("order"),
@@ -3976,6 +4026,7 @@ class GatewayRunner:
                 provider_data_collection=pr.get("data_collection"),
                 session_id=session_id,
                 tool_progress_callback=progress_callback if tool_progress_enabled else None,
+                reasoning_callback=reasoning_callback if _reasoning_mode == "stream" else None,
                 step_callback=_step_callback_sync if _hooks_ref.loaded_hooks else None,
                 platform=platform_key,
                 honcho_session_key=session_key,
@@ -4058,10 +4109,12 @@ class GatewayRunner:
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
+            last_reasoning = result.get("last_reasoning")
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
                 return {
                     "final_response": error_msg,
+                    "last_reasoning": last_reasoning,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "tools": tools_holder[0] or [],
@@ -4124,7 +4177,7 @@ class GatewayRunner:
 
             return {
                 "final_response": final_response,
-                "last_reasoning": result.get("last_reasoning"),
+                "last_reasoning": last_reasoning,
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
                 "tools": tools_holder[0] or [],
@@ -4138,6 +4191,9 @@ class GatewayRunner:
         progress_task = None
         if tool_progress_enabled:
             progress_task = asyncio.create_task(send_progress_messages())
+        reasoning_task = None
+        if reasoning_queue is not None:
+            reasoning_task = asyncio.create_task(send_reasoning_updates())
         
         # Track this agent as running for this session (for interrupt support)
         # We do this in a callback after the agent is created
@@ -4216,9 +4272,11 @@ class GatewayRunner:
                     session_key=session_key
                 )
         finally:
-            # Stop progress sender and interrupt monitor
+            # Stop progress sender, reasoning stream, and interrupt monitor
             if progress_task:
                 progress_task.cancel()
+            if reasoning_task:
+                reasoning_task.cancel()
             interrupt_monitor.cancel()
             
             # Clean up tracking
@@ -4227,7 +4285,7 @@ class GatewayRunner:
                 del self._running_agents[session_key]
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task]:
+            for task in [progress_task, reasoning_task, interrupt_monitor, tracking_task]:
                 if task:
                     try:
                         await task

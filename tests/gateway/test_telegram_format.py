@@ -7,7 +7,7 @@ or corrupt user-visible content.
 
 import re
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -34,7 +34,12 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
-from gateway.platforms.telegram import TelegramAdapter, _escape_mdv2, _strip_mdv2  # noqa: E402
+from gateway.platforms.telegram import (  # noqa: E402
+    TelegramAdapter,
+    _escape_mdv2,
+    _format_reasoning_preview_mdv2,
+    _strip_mdv2,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +108,33 @@ class TestFormatMessageBasic:
     def test_plain_text_no_markdown(self, adapter):
         result = adapter.format_message("Hello world")
         assert result == "Hello world"
+
+    def test_reasoning_preview_uses_dedicated_formatter(self, adapter):
+        result = adapter.format_message(
+            '💭 **Reasoning**\n\n*The user wrote *markdown* and (parens).*'
+        )
+        assert result.startswith("💭 *Reasoning*")
+        assert "_The user wrote \\*markdown\\* and \\(parens\\)\\._" in result
+
+
+class TestReasoningPreviewFormatting:
+    def test_formats_reasoning_preview_as_safe_mdv2(self):
+        result = _format_reasoning_preview_mdv2(
+            '💭 **Reasoning**\n\n*hello (world)*'
+        )
+        assert result == "💭 *Reasoning*\n\n_hello \\(world\\)_"
+
+
+@pytest.mark.asyncio
+async def test_edit_message_does_not_fallback_to_plain_text_on_non_parse_error(adapter):
+    adapter._bot = MagicMock()
+    adapter._bot.edit_message_text = AsyncMock(side_effect=Exception("message is not modified"))
+
+    result = await adapter.edit_message("123", "456", "💭 **Reasoning**\n\n*hello*")
+
+    assert result.success is True
+    assert result.message_id == "456"
+    assert adapter._bot.edit_message_text.await_count == 1
 
 
 # =========================================================================

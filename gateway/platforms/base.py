@@ -490,7 +490,18 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """
+        Delete a previously sent message. Optional - platforms that don't
+        support deletion return False and callers should ignore the failure.
+        """
+        return False
+
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """
         Send a typing indicator.
         
@@ -722,7 +733,12 @@ class BasePlatformAdapter(ABC):
         
         return media, cleaned
     
-    async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
+    async def _keep_typing(
+        self,
+        chat_id: str,
+        interval: float = 2.0,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         Continuously send typing indicator until cancelled.
         
@@ -731,7 +747,11 @@ class BasePlatformAdapter(ABC):
         """
         try:
             while True:
-                await self.send_typing(chat_id, metadata=metadata)
+                try:
+                    await self.send_typing(chat_id, metadata=metadata)
+                except TypeError:
+                    # Older adapters may still expose send_typing(chat_id) only.
+                    await self.send_typing(chat_id)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes

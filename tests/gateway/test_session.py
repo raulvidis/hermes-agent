@@ -379,6 +379,48 @@ class TestWhatsAppDMSessionKeyConsistency:
         key = build_session_key(source)
         assert key == "agent:main:telegram:dm"
 
+
+class TestReasoningModePersistence:
+    @pytest.fixture()
+    def store(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            s = SessionStore(sessions_dir=tmp_path, config=config)
+        s._db = None
+        s._loaded = True
+        s._entries = {}
+        return s
+
+    def test_reasoning_mode_roundtrip(self, store):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="u1",
+        )
+        entry = store.get_or_create_session(source)
+
+        store.set_reasoning_mode(entry.session_key, "stream")
+
+        saved = store._entries[entry.session_key].to_dict()
+        restored = store._entries[entry.session_key].from_dict(saved)
+        assert restored.reasoning_mode == "stream"
+
+    def test_reset_session_preserves_reasoning_mode(self, store):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="dm",
+            user_id="u1",
+        )
+        entry = store.get_or_create_session(source)
+        store.set_reasoning_mode(entry.session_key, "on")
+
+        reset = store.reset_session(entry.session_key)
+
+        assert reset is not None
+        assert reset.reasoning_mode == "on"
+
     def test_discord_group_includes_chat_id(self):
         """Group/channel keys include chat_type and chat_id."""
         source = SessionSource(

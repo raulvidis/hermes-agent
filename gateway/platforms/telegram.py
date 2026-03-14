@@ -16,9 +16,10 @@ from typing import Dict, List, Optional, Any
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
     from telegram.ext import (
         Application,
+        CallbackQueryHandler,
         CommandHandler,
         MessageHandler as TelegramMessageHandler,
         ContextTypes,
@@ -32,6 +33,7 @@ except ImportError:
     Bot = Any
     Message = Any
     Application = Any
+    CallbackQueryHandler = Any
     CommandHandler = Any
     TelegramMessageHandler = Any
     filters = None
@@ -90,6 +92,29 @@ def _strip_mdv2(text: str) -> str:
     # Use word boundary (\b) to avoid breaking snake_case like my_variable_name
     cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)
     return cleaned
+
+
+def _format_reasoning_preview_mdv2(content: str) -> str:
+    """Format the transient reasoning preview as safe MarkdownV2."""
+    prefix = "💭 **Reasoning**"
+    if not content.startswith(prefix):
+        return content
+
+    body = content[len(prefix):].lstrip("\n")
+    escaped_lines = []
+    for line in body.splitlines():
+        if line.strip():
+            inner = line.strip()
+            if inner.startswith("*") and inner.endswith("*") and len(inner) >= 2:
+                inner = inner[1:-1]
+            escaped_lines.append(f"_{_escape_mdv2(inner)}_")
+        else:
+            escaped_lines.append("")
+
+    escaped_body = "\n".join(escaped_lines).strip()
+    if not escaped_body:
+        return "💭 *Reasoning*"
+    return f"💭 *Reasoning*\n\n{escaped_body}"
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -193,6 +218,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             
             # Start polling in background
             await self._app.initialize()
@@ -236,6 +262,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommand("update", "Update Hermes to the latest version"),
                     BotCommand("reload_mcp", "Reload MCP servers from config"),
                     BotCommand("voice", "Toggle voice reply mode"),
+                    BotCommand("reasoning", "Control reasoning visibility"),
                     BotCommand("help", "Show available commands"),
                 ])
             except Exception as e:
@@ -357,13 +384,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
                 )
-            except Exception:
-                # Fallback: retry without markdown formatting
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=content,
-                )
+            except Exception as md_error:
+                err_text = str(md_error).lower()
+                if "not modified" in err_text:
+                    return SendResult(success=True, message_id=message_id)
+                if "parse" in err_text or "markdown" in err_text:
+                    plain_text = _strip_mdv2(formatted)
+                    await self._bot.edit_message_text(
+                        chat_id=int(chat_id),
+                        message_id=int(message_id),
+                        text=plain_text,
+                        parse_mode=None,
+                    )
+                else:
+                    raise
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error(
@@ -374,6 +408,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a previously sent Telegram message."""
+        if not self._bot:
+            return False
+        try:
+            await self._bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+            return True
+        except Exception:
+            return False
 
     async def send_voice(
         self,
@@ -674,6 +725,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not content:
             return content
 
+        if content.startswith("💭 **Reasoning**"):
+            return _format_reasoning_preview_mdv2(content)
+
         placeholders: dict = {}
         counter = [0]
 
@@ -754,9 +808,57 @@ class TelegramAdapter(BasePlatformAdapter):
         """Handle incoming command messages."""
         if not update.message or not update.message.text:
             return
+
+        if update.message.text.strip().lower() == "/reasoning":
+            if not self._bot:
+                return
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Off", callback_data="reasoning:off"),
+                    InlineKeyboardButton("On", callback_data="reasoning:on"),
+                    InlineKeyboardButton("Stream", callback_data="reasoning:stream"),
+                ]
+            ])
+            await self._bot.send_message(
+                chat_id=update.message.chat_id,
+                text="Reasoning visibility for this chat:",
+                reply_markup=keyboard,
+                message_thread_id=int(update.message.message_thread_id) if getattr(update.message, "message_thread_id", None) else None,
+            )
+            return
         
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
+
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+
+        if not query.data.startswith("reasoning:"):
+            return
+
+        mode = query.data.split(":", 1)[1]
+        response_text = None
+        if self._message_handler and query.message:
+            event = self._build_message_event(query.message, MessageType.COMMAND)
+            event.text = f"/reasoning {mode}"
+            try:
+                response_text = await self._message_handler(event)
+            except Exception:
+                logger.exception("[%s] Failed to process reasoning callback", self.name)
+
+        if not response_text:
+            fallback_labels = {
+                "off": "Reasoning disabled for this chat.",
+                "on": "Reasoning enabled and hidden for this chat.",
+                "stream": "Reasoning enabled and will stream live for this chat.",
+            }
+            response_text = fallback_labels.get(mode, f"Reasoning set to {mode}.")
+
+        await query.edit_message_text(response_text)
     
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
