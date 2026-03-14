@@ -1,6 +1,6 @@
 ---
 name: android
-description: Control an Android phone — navigate apps, tap, type, swipe, and automate Uber, WhatsApp, Spotify, Maps, Settings, Tinder
+description: Control an Android phone remotely — navigate apps, tap, type, swipe, and automate Uber, WhatsApp, Spotify, Maps, Settings, Tinder
 version: 1.0.0
 metadata:
   hermes:
@@ -10,14 +10,31 @@ metadata:
 
 # Android Device Control
 
-Use the `android_*` tools to read and interact with an Android phone running the Hermes Bridge app.
+You can control an Android phone remotely using the `android_*` tools. The phone runs a companion app called **Hermes Bridge** which exposes an HTTP API. You communicate with it over the network — no USB, no ADB, no physical connection needed.
 
-## Setup
+## How It Works
 
-If not configured yet, ask the user for the phone's IP and pairing code, then call:
 ```
-android_setup("<ip>:8765", "<pairing_code>")
+Hermes Agent (this server)  ──HTTP──>  Hermes Bridge app (Android phone)
+                                        ├── Reads screen via AccessibilityService
+                                        ├── Performs taps, types, swipes
+                                        └── Authenticated via pairing code
 ```
+
+## Setup / Connecting to a Phone
+
+When the user wants to connect their phone, ask them for TWO things:
+1. **IP address** — shown in the Hermes Bridge app on their phone (e.g. `192.168.1.50`)
+2. **Pairing code** — a 6-character code shown in the Hermes Bridge app (e.g. `K7V3NP`)
+
+Then call the setup tool:
+```
+android_setup("http://<ip>:8765", "<pairing_code>")
+```
+
+This saves the config to `~/.hermes/.env` and verifies the connection. After setup, all other `android_*` tools will work automatically.
+
+**Do NOT ask about USB, ADB, or developer options.** The connection is fully remote over HTTP. The user just needs the Hermes Bridge app installed and running on their phone.
 
 ## Core Patterns
 
