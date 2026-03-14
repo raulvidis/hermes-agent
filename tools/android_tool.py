@@ -25,15 +25,27 @@ import requests
 from typing import Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
+#
+# Architecture: Phone connects OUT to Hermes server via WebSocket (NAT-friendly).
+# A relay server runs on localhost and bridges HTTP tool calls to the phone.
+#
+#   Tools ──HTTP──> Relay (localhost:8766) ──WebSocket──> Phone
+#
+# For local/USB dev, tools can also talk directly to the phone's HTTP server
+# by setting ANDROID_BRIDGE_URL to the phone's IP.
 
 def _bridge_url() -> str:
-    return os.getenv("ANDROID_BRIDGE_URL", "http://localhost:8765")
+    """URL of the relay (default) or direct phone connection."""
+    return os.getenv("ANDROID_BRIDGE_URL", "http://localhost:8766")
 
 def _bridge_token() -> Optional[str]:
     return os.getenv("ANDROID_BRIDGE_TOKEN")
 
+def _relay_port() -> int:
+    return int(os.getenv("ANDROID_RELAY_PORT", "8766"))
+
 def _timeout() -> float:
-    return float(os.getenv("ANDROID_BRIDGE_TIMEOUT", "10"))
+    return float(os.getenv("ANDROID_BRIDGE_TIMEOUT", "30"))
 
 def _auth_headers() -> dict:
     """Build auth headers with pairing code if configured."""
@@ -43,10 +55,13 @@ def _auth_headers() -> dict:
     return {}
 
 def _check_requirements() -> bool:
-    """Returns True only if the bridge is reachable."""
+    """Returns True if the relay is running and a phone is connected."""
     try:
         r = requests.get(f"{_bridge_url()}/ping", headers=_auth_headers(), timeout=2)
-        return r.status_code == 200
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("phone_connected", False) or data.get("accessibilityService", False)
+        return False
     except Exception:
         return False
 
@@ -238,71 +253,78 @@ def android_current_app() -> str:
         return json.dumps({"error": str(e)})
 
 
-def android_setup(bridge_url: str, pairing_code: str) -> str:
+def android_setup(pairing_code: str) -> str:
     """
-    Configure the Android bridge connection. Saves ANDROID_BRIDGE_URL and
-    ANDROID_BRIDGE_TOKEN to ~/.hermes/.env, then verifies the connection.
+    Start the Android bridge relay and configure the pairing code.
+    The relay runs on this server and waits for the phone to connect via WebSocket.
 
-    Call this when the user provides their phone's IP and pairing code.
-    Example: android_setup("http://192.168.1.50:8765", "K7V3NP")
+    The user needs to:
+    1. Open the Hermes Bridge app on their phone
+    2. Enter this server's public IP/domain and the pairing code
+    3. The phone connects to the relay automatically
+
+    Call this when the user provides their pairing code from the Hermes Bridge app.
+    Example: android_setup("K7V3NP")
     """
     try:
-        # Validate URL format
-        if not bridge_url.startswith("http"):
-            bridge_url = f"http://{bridge_url}"
-        if ":8765" not in bridge_url and ":" not in bridge_url.split("//")[1]:
-            bridge_url = f"{bridge_url}:8765"
+        port = _relay_port()
 
-        # Save to ~/.hermes/.env using hermes-agent's config system
+        # Save config to ~/.hermes/.env
+        relay_url = f"http://localhost:{port}"
         try:
             from hermes_cli.config import save_env_value
-            save_env_value("ANDROID_BRIDGE_URL", bridge_url)
+            save_env_value("ANDROID_BRIDGE_URL", relay_url)
             save_env_value("ANDROID_BRIDGE_TOKEN", pairing_code)
+            save_env_value("ANDROID_RELAY_PORT", str(port))
         except ImportError:
-            # Fallback: write directly
             from pathlib import Path
             env_path = Path.home() / ".hermes" / ".env"
             env_path.parent.mkdir(parents=True, exist_ok=True)
-            _update_env_file(env_path, "ANDROID_BRIDGE_URL", bridge_url)
+            _update_env_file(env_path, "ANDROID_BRIDGE_URL", relay_url)
             _update_env_file(env_path, "ANDROID_BRIDGE_TOKEN", pairing_code)
+            _update_env_file(env_path, "ANDROID_RELAY_PORT", str(port))
 
-        # Update current process env so subsequent calls work immediately
-        os.environ["ANDROID_BRIDGE_URL"] = bridge_url
+        # Update current process env
+        os.environ["ANDROID_BRIDGE_URL"] = relay_url
         os.environ["ANDROID_BRIDGE_TOKEN"] = pairing_code
 
-        # Verify connection
-        headers = {"Authorization": f"Bearer {pairing_code}"}
-        r = requests.get(f"{bridge_url}/ping", headers=headers, timeout=5)
-        ping_data = r.json()
+        # Start the relay server
+        try:
+            from tools.android_relay import start_relay, is_relay_running, is_phone_connected
+            start_relay(pairing_code=pairing_code, port=port)
 
-        if r.status_code == 200 and ping_data.get("authenticated"):
+            # Check if phone is already connected
+            import time
+            time.sleep(1)  # brief wait for relay to start
+            phone_connected = is_phone_connected()
+
             return json.dumps({
                 "status": "ok",
-                "message": "Android bridge configured and connected!",
-                "bridge_url": bridge_url,
-                "accessibility_service": ping_data.get("accessibilityService"),
-                "authenticated": True,
+                "message": "Relay started! " + (
+                    "Phone is already connected — ready to go!"
+                    if phone_connected else
+                    "Waiting for phone to connect. "
+                    "Tell the user to open the Hermes Bridge app, enter this server's address and the pairing code."
+                ),
+                "relay_url": relay_url,
+                "relay_port": port,
+                "pairing_code": pairing_code,
+                "phone_connected": phone_connected,
+                "setup_instructions": (
+                    "On the phone's Hermes Bridge app:\n"
+                    f"1. Enter server address: <this-server-public-ip>:{port}\n"
+                    f"2. Pairing code is already set to: {pairing_code}\n"
+                    "3. Tap Connect"
+                ),
             })
-        elif r.status_code == 200:
+        except ImportError:
             return json.dumps({
                 "status": "partial",
-                "message": "Bridge reachable but pairing code not accepted. Check the code in the Hermes Bridge app.",
-                "bridge_url": bridge_url,
-                "authenticated": False,
-            })
-        else:
-            return json.dumps({
-                "status": "error",
-                "message": f"Bridge returned HTTP {r.status_code}",
+                "message": "Config saved but android_relay module not found. The relay needs to be installed.",
+                "relay_url": relay_url,
+                "pairing_code": pairing_code,
             })
 
-    except (requests.exceptions.ConnectionError, ConnectionError):
-        return json.dumps({
-            "status": "error",
-            "message": f"Cannot reach bridge at {bridge_url}. Check that the Hermes Bridge app is running and the IP/port are correct.",
-            "saved": True,
-            "hint": "Config was saved — connection will work once the bridge is reachable.",
-        })
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -464,20 +486,16 @@ _SCHEMAS = {
     },
     "android_setup": {
         "name": "android_setup",
-        "description": "Configure the Android bridge connection. Use when the user provides their phone's IP address and pairing code from the Hermes Bridge app. Saves config to ~/.hermes/.env and verifies the connection.",
+        "description": "Start the Android bridge relay and set the pairing code. Call this when the user wants to connect their phone. The relay runs on this server — the phone connects to it remotely via WebSocket. Only needs the pairing code shown in the Hermes Bridge app on the phone.",
         "parameters": {
             "type": "object",
             "properties": {
-                "bridge_url": {
-                    "type": "string",
-                    "description": "Bridge URL e.g. http://192.168.1.50:8765 or just 192.168.1.50",
-                },
                 "pairing_code": {
                     "type": "string",
-                    "description": "6-character pairing code shown in the Hermes Bridge app",
+                    "description": "6-character pairing code shown in the Hermes Bridge app on the phone",
                 },
             },
-            "required": ["bridge_url", "pairing_code"],
+            "required": ["pairing_code"],
         },
     },
 }

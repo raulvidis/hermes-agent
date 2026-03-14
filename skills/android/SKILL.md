@@ -23,18 +23,19 @@ Hermes Agent (this server)  ──HTTP──>  Hermes Bridge app (Android phone)
 
 ## Setup / Connecting to a Phone
 
-When the user wants to connect their phone, ask them for TWO things:
-1. **IP address** — shown in the Hermes Bridge app on their phone (e.g. `192.168.1.50`)
-2. **Pairing code** — a 6-character code shown in the Hermes Bridge app (e.g. `K7V3NP`)
+When the user wants to connect their phone, ask them for ONE thing:
+- **Pairing code** — a 6-character code shown in the Hermes Bridge app on their phone (e.g. `K7V3NP`)
 
 Then call the setup tool:
 ```
-android_setup("http://<ip>:8765", "<pairing_code>")
+android_setup("<pairing_code>")
 ```
 
-This saves the config to `~/.hermes/.env` and verifies the connection. After setup, all other `android_*` tools will work automatically.
+This starts a relay server on this machine and waits for the phone to connect. The user then enters this server's address in the Hermes Bridge app on their phone, and the phone connects via WebSocket.
 
-**Do NOT ask about USB, ADB, or developer options.** The connection is fully remote over HTTP. The user just needs the Hermes Bridge app installed and running on their phone.
+**The phone connects to the server, not the other way around.** This works even when the phone is behind NAT (home WiFi) and the server is in the cloud. No port forwarding, no VPN, no USB needed.
+
+**Do NOT ask about USB, ADB, developer options, or the phone's IP address.** The user only needs the pairing code from their phone app.
 
 ## Core Patterns
 
