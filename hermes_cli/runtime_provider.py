@@ -716,7 +716,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             if not is_provider_enabled(entry):
                 continue
             # Resolve the API key from the env var name stored in key_env
-            key_env = str(entry.get("key_env", "") or "").strip()
+            key_env = str(entry.get("key_env", "") or entry.get("api_key_env", "") or "").strip()
             resolved_api_key = _getenv(key_env, "").strip() if key_env else ""
             # Fall back to inline api_key when key_env is absent or unresolvable
             if not resolved_api_key:
@@ -782,7 +782,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             "base_url": base_url.strip(),
             "api_key": str(entry.get("api_key", "") or "").strip(),
         }
-        key_env = str(entry.get("key_env", "") or "").strip()
+        key_env = str(entry.get("key_env", "") or entry.get("api_key_env", "") or "").strip()
         if key_env:
             result["key_env"] = key_env
         if provider_key:
